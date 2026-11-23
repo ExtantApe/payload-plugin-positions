@@ -1,8 +1,17 @@
 # payload-plugin-positions
 
-Positions for Payload: scoped grants that open tools or portals, held in one `position-grants` collection. The host names the position types and scope kinds and decides who may grant. Nobody can grant until it does.
+Positions for Payload: scoped, dated grants people hold on a site, an organization or a project, with host-defined types, grant rules and an audit trail.
 
 **Status:** early, 0.x, not on npm yet. The 46 tests run against a real Payload with an in-memory MongoDB. It hasn't been tried in a real app, and the admin screens haven't been looked at in a browser.
+
+## Agreed scope
+
+The scope agreed with Captive Origins:
+
+- **A position is a scoped, dated grant** that opens tools or portals: on a site, an organization or a project.
+- **One grant table** holds the person, the position type, the scope, start and end dates, who granted it, and an audit trail.
+- **The host passes in** the position types, the scope kinds and who may grant each. Each defaults to nobody.
+- **A hook can refuse a grant.** A host uses it so minors never hold positions.
 
 ## What it does
 

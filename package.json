@@ -2,16 +2,17 @@
   "name": "@extantape/payload-plugin-positions",
   "version": "0.0.0",
   "private": true,
-  "description": "Positions for Payload: named roles people hold in an organization, for business accounts. A skeleton; the scope is still to come.",
+  "description": "Positions for Payload: scoped, dated grants people hold on a site, an organization or a project, with host-defined types, grant rules and an audit trail.",
   "keywords": [
     "payload",
     "payload-plugin",
     "payloadcms",
     "positions",
+    "grants",
     "roles",
     "organizations",
-    "business-accounts",
-    "access-control"
+    "access-control",
+    "audit-trail"
   ],
   "license": "MIT",
   "homepage": "https://github.com/ExtantApe/payload-plugin-positions#readme",
