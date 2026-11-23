@@ -18,8 +18,11 @@ import {
 const refuse = (message: string) => new APIError(message, 403, undefined, true)
 const GENERAL = 'This position can’t be granted.'
 const LIVE: PositionStatus[] = ['active', 'paused']
-const dateOk = (v: unknown) => v === null || v === undefined || v === '' || !Number.isNaN(Date.parse(String(v)))
-const ms = (v: unknown) => (v ? Date.parse(String(v)) : null)
+const ISO = /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/
+const none = (v: unknown) => v === null || v === undefined || v === ''
+/** A date as milliseconds, null for no date, and NaN for anything that isn't an ISO date string or a Date (so `0` and `'1'` are bad dates, not no date). */
+const ms = (v: unknown): number | null => (none(v) ? null : v instanceof Date ? v.getTime() : typeof v === 'string' && ISO.test(v) ? Date.parse(v) : Number.NaN)
+const dateOk = (v: unknown) => none(v) || !Number.isNaN(ms(v))
 const same = (a: unknown, b: unknown) => a !== null && a !== undefined && b !== null && b !== undefined && String(a) === String(b)
 
 /** Only the plugin's own code may add a history row. */
@@ -71,7 +74,13 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
   }
   const canGrant = (req: PayloadRequest, extra: Partial<AccessArgs> = {}) => ask(opts.canGrant, req, extra)
   const canRevoke = (req: PayloadRequest, extra: Partial<AccessArgs> = {}) => ask(opts.canRevoke ?? opts.canGrant, req, extra)
-  const by = (req: PayloadRequest) => idOf(req.user)
+  /** The signed-in user's id, only when they are in the users collection. Relationship fields can only hold those. */
+  const by = (req: PayloadRequest) => idOf(signedIn(req))
+  /** Who acted, as `collection:id`, so ids from different collections never look alike. Null for server code. */
+  const actor = (req: PayloadRequest) => {
+    const u = req.user as { id?: string | number; collection?: string } | null
+    return u && u.id !== undefined && u.collection ? { collection: u.collection, id: u.id } : null
+  }
   /** Notes and history. Nobody without the host's `canReadPrivate`; only `true` or, for history, a `where` counts. */
   async function readPrivate(req: PayloadRequest, grant?: PositionGrant): Promise<boolean | Where> {
     const user = signedIn(req)
@@ -142,7 +151,7 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
     writingHistory.run(true, () =>
       req.payload.create({
         collection: HISTORY as never,
-        data: { grant: String(grant.id), event, by: by(req) === null ? null : String(by(req)), snapshot: snapshot(grant), previous: previous ? snapshot(previous) : null } as never,
+        data: { grant: String(grant.id), event, by: actor(req) ? `${actor(req)!.collection}:${String(actor(req)!.id)}` : null, snapshot: snapshot(grant), previous: previous ? snapshot(previous) : null } as never,
         overrideAccess: true,
         req,
       }),
@@ -285,7 +294,7 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
             }
             // The database's unique index on this key is what stops two requests at once.
             data.liveKey = JSON.stringify([holder, data.position, data.scopeKind ?? null, data.scopeId ?? null])
-            await run('beforeGrant', { event: 'grant', phase: 'before', grant, by: asker, req }, true)
+            await run('beforeGrant', { event: 'grant', phase: 'before', grant, by: actor(req), req }, true)
             return data
           }
 
@@ -300,6 +309,9 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
           delete data.revokedAt
           delete data.revokedBy
           delete data.liveKey
+          // Someone who can't read the notes can't overwrite them either: it would destroy what they can't see.
+          if ('notes' in data && (data.notes ?? '') !== (originalDoc.notes ?? '') && req.user && (await readPrivate(req, before)) !== true)
+            throw refuse('You can’t change these notes.')
           const status: PositionStatus = (data.status ?? before.status) as PositionStatus
           if (!['active', 'paused', 'revoked', 'expired'].includes(status)) throw refuse('Unknown status.')
           const wasLive = LIVE.includes(before.status)
@@ -342,7 +354,7 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
             data.liveKey = `ended:${String(originalDoc.id)}`
           }
           for (const event of eventsOf(before, next))
-            await run(hookName('before', event), { event, phase: 'before', grant: merged, previous: before, by: asker, req }, true)
+            await run(hookName('before', event), { event, phase: 'before', grant: merged, previous: before, by: actor(req), req }, true)
           return data
         },
       ],
@@ -352,12 +364,12 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
           const asker = by(req)
           if (operation === 'create') {
             await record(req, 'grant', grant)
-            await run('afterGrant', { event: 'grant', phase: 'after', grant, by: asker, req }, false)
+            await run('afterGrant', { event: 'grant', phase: 'after', grant, by: actor(req), req }, false)
           } else if (previousDoc) {
             const previous = normalize(previousDoc)
             for (const event of eventsOf(previous, grant)) {
               await record(req, event, grant, previous)
-              await run(hookName('after', event), { event, phase: 'after', grant, previous, by: asker, req }, false)
+              await run(hookName('after', event), { event, phase: 'after', grant, previous, by: actor(req), req }, false)
             }
           }
           return doc

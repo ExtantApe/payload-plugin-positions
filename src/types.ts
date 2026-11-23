@@ -65,8 +65,8 @@ export type AuditEvent = {
   grant: PositionGrant
   /** The grant as it was before a revoke or expiry. Absent for a grant. */
   previous?: PositionGrant
-  /** The signed-in user's id, or null for server code and the expiry sweep. */
-  by: string | number | null
+  /** Who acted: the signed-in user's auth collection and id, or null for server code and the expiry sweep. */
+  by: { collection: string; id: string | number } | null
   req: PayloadRequest
 }
 

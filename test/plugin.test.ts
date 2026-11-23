@@ -509,7 +509,7 @@ describe('review fixes', () => {
     await update(g.id, { status: 'revoked' })
     const rows = await history()
     expect(rows.map((r) => r.event)).toEqual(['grant', 'pause', 'resume', 'endDate', 'revoke'])
-    expect(String(rows[0]!.by)).toBe(String(staff.id))
+    expect(rows[0]!.by).toBe(`users:${staff.id}`)
     expect(JSON.stringify(rows)).not.toContain('private')
     const row = (await payload.find({ collection: 'position-grant-history' as never, limit: 1, overrideAccess: true })).docs[0] as never as { id: string }
     const read = (u: U) => payload.find({ collection: 'position-grant-history' as never, user: as(u), overrideAccess: false })
@@ -684,6 +684,66 @@ describe('second review fixes', () => {
     expect(await refused(p.create({ collection: 'position-grants' as never, data, user: as(u), overrideAccess: false }))).toMatch(/can’t be done right now/)
     expect((await p.find({ collection: 'position-grants' as never, overrideAccess: true })).totalDocs).toBe(0)
     await p.db.destroy?.()
+  })
+})
+
+describe('third review fixes', () => {
+  const update = (id: string, data: Record<string, unknown>, user: U | null = staff) =>
+    payload.update({ collection: 'position-grants' as never, id, data: data as never, user: (user ? as(user) : undefined) as never, overrideAccess: false })
+
+  it('refuses a self-grant when the holder is sent as { id }', async () => {
+    expect(await refused(grant({ ...base(), holder: { id: staff.id } }))).toMatch(/your own account/)
+    expect((await grants()).totalDocs).toBe(0)
+  })
+
+  it('records who acted with their auth collection, and leaves grantedBy empty for a user outside the users collection', async () => {
+    const g = (await payload.create({
+      collection: 'position-grants' as never,
+      data: base() as never,
+      user: { id: 'x1', collection: 'admins' } as never,
+      overrideAccess: true,
+    })) as never as { id: string; grantedBy?: unknown }
+    expect(g.grantedBy ?? null).toBeNull()
+    const rows = (await payload.find({ collection: 'position-grant-history' as never, overrideAccess: true })).docs as never as { by: string }[]
+    expect(rows[0]!.by).toBe('admins:x1')
+  })
+
+  it('stops someone who can’t read the notes from overwriting them', async () => {
+    const g = (await grant({ ...base(), notes: 'for staff' })) as never as { id: string }
+    expect(await refused(update(g.id, { notes: 'wiped' }, revoker))).toMatch(/can’t change these notes/)
+    await update(g.id, { status: 'paused' }, revoker) // other edits are fine, and an unchanged note is fine
+    await update(g.id, { notes: 'for staff' }, revoker)
+    await update(g.id, { notes: 'edited' })
+    const read = (await payload.findByID({ collection: 'position-grants' as never, id: g.id, user: as(staff), overrideAccess: false })) as never as { notes: string }
+    expect(read.notes).toBe('edited')
+  })
+
+  it('treats only ISO dates as dates: "1", words, numbers and 0 are refused, not read as no date', async () => {
+    for (const bad of ['1', 'tomorrow', 0, 5, '2026', true]) {
+      expect(await refused(grant({ ...base(), endsAt: bad }))).toMatch(/dates aren’t valid/)
+      expect(await refused(grant({ ...base(), startsAt: bad }))).toMatch(/dates aren’t valid/)
+    }
+    const g = (await grant({ ...base(), endsAt: iso(DAY) })) as never as { id: string }
+    for (const bad of ['1', 0, 'soon']) expect(await refused(update(g.id, { endsAt: bad }))).toMatch(/isn’t valid/)
+    await grant({ ...base(), scopeId: 'p-2', endsAt: '' }) // empty means none
+    await grant({ ...base(), scopeId: 'p-3', startsAt: new Date(Date.now() - DAY).toISOString().slice(0, 10) }) // a plain date is fine
+  })
+
+  it('refuses bulk update and bulk delete of the history, even with access skipped', async () => {
+    const g = (await grant(base())) as never as { id: string }
+    await payload.update({ collection: 'position-grants' as never, id: g.id, data: { status: 'paused' } as never, user: as(staff), overrideAccess: false })
+    const before = (await history()).length
+    const bulkUp = (await payload.update({ collection: 'position-grant-history' as never, where: { event: { exists: true } }, data: { event: 'revoke' } as never, overrideAccess: true }).catch(() => ({ docs: [], errors: [1] }))) as never as { docs: unknown[]; errors: unknown[] }
+    const bulkDel = (await payload.delete({ collection: 'position-grant-history' as never, where: { event: { exists: true } }, overrideAccess: true }).catch(() => ({ docs: [], errors: [1] }))) as never as { docs: unknown[]; errors: unknown[] }
+    expect(bulkUp.docs).toHaveLength(0)
+    expect(bulkDel.docs).toHaveLength(0)
+    expect(bulkUp.errors.length + bulkDel.errors.length).toBeGreaterThan(0)
+    const asStaff = (u: U) => ({ user: as(u), overrideAccess: false })
+    expect(await refused(payload.update({ collection: 'position-grant-history' as never, where: { event: { exists: true } }, data: { event: 'revoke' } as never, ...asStaff(staff) }))).toBeTruthy()
+    expect(await refused(payload.delete({ collection: 'position-grant-history' as never, where: { event: { exists: true } }, ...asStaff(staff) }))).toBeTruthy()
+    const rows = await history()
+    expect(rows.length).toBe(before)
+    expect((rows as never as { event: string }[]).map((r) => r.event).sort()).toEqual(['grant', 'pause'])
   })
 })
 
