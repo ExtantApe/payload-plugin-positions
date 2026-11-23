@@ -5,7 +5,7 @@ import { MongoMemoryReplSet } from 'mongodb-memory-server'
 import { buildConfig, createLocalReq, getPayload, handleEndpoints, type Payload } from 'payload'
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { expireGrants, hasPosition, positions, positionsOf, type AuditEvent } from '../src/index.js'
+import { checkTransactions, expireGrants, hasPosition, positions, positionsOf, type AuditEvent } from '../src/index.js'
 
 /**
  * A made-up site: users with a level (staff may grant), two position types and two scope kinds, a host veto for anyone
@@ -667,7 +667,7 @@ describe('second review fixes', () => {
     expect((await history()).length).toBe(1)
   })
 
-  it('refuses every change when the database has no transactions, unless the host accepts that', async () => {
+  it('refuses to start when the database has no transactions, unless the host accepts that', async () => {
     const build = (name: string, allow: boolean) =>
       buildConfig({
         secret: 'test-secret-not-for-production',
@@ -677,13 +677,151 @@ describe('second review fixes', () => {
         collections: [{ slug: 'users', auth: true, fields: [] }],
         plugins: [positions({ positionTypes: [{ value: 'editor' }], scopeKinds: [{ value: 'project' }], refuseGrant: false, canGrant: () => true, allowWithoutTransactions: allow })],
       })
-    const p = await getPayload({ config: await build('notx', false), key: 'notx' })
+    await expect(getPayload({ config: await build('notx', false), key: 'notx' })).rejects.toThrow(/transactions off/)
+    const p = await getPayload({ config: await build('notx-ok', true), key: 'notx-ok' })
+    await p.db.destroy?.()
+  })
+
+  it('checks the adapter for a real transaction: null or undefined refuses, an id is rolled back', async () => {
+    // Shaped like db-mongodb with transactionOptions false: beginTransaction is a no-op that returns null.
+    const off = { db: { beginTransaction: vi.fn(async () => null), rollbackTransaction: vi.fn(async () => undefined) } }
+    await expect(checkTransactions(off as never)).rejects.toThrow(/transactions off/)
+    expect(off.db.rollbackTransaction).not.toHaveBeenCalled()
+    const undef = { db: { beginTransaction: vi.fn(async () => undefined), rollbackTransaction: vi.fn() } }
+    await expect(checkTransactions(undef as never)).rejects.toThrow(/transactions off/)
+    const throws = { db: { beginTransaction: vi.fn(async () => { throw new Error('nope') }), rollbackTransaction: vi.fn() } }
+    await expect(checkTransactions(throws as never)).rejects.toThrow(/transactions off/)
+    await expect(checkTransactions(off as never, true)).resolves.toBeUndefined()
+    expect(off.db.beginTransaction).toHaveBeenCalledTimes(1) // the opt-in doesn't even ask
+    const on = { db: { beginTransaction: vi.fn(async () => 'tx-1'), rollbackTransaction: vi.fn(async () => undefined) } }
+    await expect(checkTransactions(on as never)).resolves.toBeUndefined()
+    expect(on.db.rollbackTransaction).toHaveBeenCalledWith('tx-1')
+  })
+})
+
+describe('follow-ups', () => {
+  const update = (id: string, data: Record<string, unknown>, user: U | null = staff) =>
+    payload.update({ collection: 'position-grants' as never, id, data: data as never, user: (user ? as(user) : undefined) as never, overrideAccess: false })
+
+  it('shows canReadPrivate no grant at all when there is no document, so a blanket rule can’t open the history by accident', async () => {
+    const calls: unknown[] = []
+    const site = await buildConfig({
+      secret: 'test-secret-not-for-production',
+      telemetry: false,
+      typescript: { autoGenerate: false },
+      db: mongooseAdapter({ url: mongo.getUri('nogrant'), ensureIndexes: true }),
+      collections: [{ slug: 'users', auth: true, fields: [] }],
+      plugins: [
+        positions({
+          positionTypes: [{ value: 'editor' }],
+          scopeKinds: [{ value: 'project' }],
+          refuseGrant: false,
+          canGrant: () => true,
+          // A host rule written for notes: yes unless the scope is p-9.
+          canReadPrivate: ({ grant }) => {
+            calls.push(grant)
+            return grant?.scopeId !== 'p-9'
+          },
+        }),
+      ],
+    })
+    const p = await getPayload({ config: site, key: 'nogrant' })
     const u = (await p.create({ collection: 'users', data: { email: 'a@example.com', password: PW } as never })) as unknown as U
     const h = (await p.create({ collection: 'users', data: { email: 'b@example.com', password: PW } as never })) as unknown as U
-    const data = { holder: h.id, position: 'editor', scopeKind: 'project', scopeId: 'a' } as never
-    expect(await refused(p.create({ collection: 'position-grants' as never, data, user: as(u), overrideAccess: false }))).toMatch(/can’t be done right now/)
-    expect((await p.find({ collection: 'position-grants' as never, overrideAccess: true })).totalDocs).toBe(0)
+    await p.create({ collection: 'position-grants' as never, data: { holder: h.id, position: 'editor', scopeKind: 'project', scopeId: 'p-9', notes: 'x' } as never, user: as(u), overrideAccess: false })
+    calls.length = 0
+    await p.find({ collection: 'position-grant-history' as never, user: as(u), overrideAccess: false })
+    expect(calls).toEqual([undefined]) // not a blank grant such as { holder: undefined, ... }
     await p.db.destroy?.()
+  })
+
+  it('refuses dates that don’t exist and times with no zone, and accepts zoned times', async () => {
+    for (const bad of ['2026-02-30', '2027-02-29', '2026-13-01', '2026-04-31', '2099-01-01T10:00', '2099-01-01 10:00:00', '2099-01-01T24:00:00Z', '2099-01-01T10:60Z', '2099-01-01T10:00:00+25:00']) {
+      expect(await refused(grant({ ...base(), endsAt: bad })), bad).toMatch(/dates aren’t valid/)
+      expect(await refused(grant({ ...base(), startsAt: bad })), bad).toMatch(/dates aren’t valid/)
+    }
+    const g = (await grant({ ...base(), endsAt: iso(DAY) })) as never as { id: string }
+    for (const bad of ['2099-02-30', '2099-01-01T10:00']) expect(await refused(update(g.id, { endsAt: bad })), bad).toMatch(/isn’t valid/)
+    await grant({ ...base(), scopeId: 'p-2', endsAt: '2099-01-01T10:00:00Z' })
+    await grant({ ...base(), scopeId: 'p-3', endsAt: '2099-01-01T10:00:00+02:00' })
+    await grant({ ...base(), scopeId: 'p-4', endsAt: '2096-02-29' }) // a real leap day
+    expect((await grants()).totalDocs).toBe(4)
+  })
+
+  it('shows the veto a null end date when an extension removes the end', async () => {
+    const g = (await grant({ ...base(), endsAt: iso(5 * DAY) })) as never as { id: string }
+    const seenEnds: unknown[] = []
+    answers.refuse = (a) => {
+      seenEnds.push((a as unknown as { grant: { endsAt?: unknown } }).grant.endsAt)
+      return null
+    }
+    await update(g.id, { endsAt: null })
+    expect(seenEnds).toHaveLength(1)
+    expect(seenEnds[0] ?? null).toBeNull()
+    seenEnds.length = 0
+    await grant({ ...base(), scopeId: 'p-2' }) // an open-ended grant, too
+    expect(seenEnds).toHaveLength(1)
+    expect(seenEnds[0] ?? null).toBeNull()
+  })
+
+  describe('with no canReadPrivate, over REST and GraphQL', () => {
+    let p: Payload
+    let granter: U & { email: string }
+    let gid: string
+    beforeAll(async () => {
+      const site = await buildConfig({
+        secret: 'test-secret-not-for-production',
+        telemetry: false,
+        typescript: { autoGenerate: false },
+        db: mongooseAdapter({ url: mongo.getUri('noprivate-api'), ensureIndexes: true }),
+        collections: [{ slug: 'users', auth: true, fields: [] }],
+        plugins: [positions({ positionTypes: [{ value: 'editor' }], scopeKinds: [{ value: 'project' }], refuseGrant: false, canGrant: () => true })],
+      })
+      p = await getPayload({ config: site, key: 'noprivate-api' })
+      granter = (await p.create({ collection: 'users', data: { email: 'g@example.com', password: PW } as never })) as never
+      const h = (await p.create({ collection: 'users', data: { email: 'h@example.com', password: PW } as never })) as unknown as U
+      const g = (await p.create({ collection: 'position-grants' as never, data: { holder: h.id, position: 'editor', scopeKind: 'project', scopeId: 'a', notes: 'secret note' } as never, user: as(granter), overrideAccess: false })) as never as { id: string }
+      gid = String(g.id)
+    })
+    afterAll(async () => {
+      await p?.db?.destroy?.()
+    })
+
+    it('hides notes and history over REST', async () => {
+      const token = (await p.login({ collection: 'users', data: { email: granter.email, password: PW } })).token!
+      const call = async (path: string) => {
+        const res = await handleEndpoints({
+          config: p.config as never,
+          payloadInstanceCacheKey: 'noprivate-api',
+          request: new Request(`https://site.example/api${path}`, { method: 'GET', headers: { Authorization: `JWT ${token}` } }),
+        })
+        return { status: res.status, text: await res.text() }
+      }
+      const one = await call(`/position-grants/${gid}`)
+      expect(one.status).toBe(200)
+      expect(one.text).toContain('editor')
+      expect(one.text).not.toContain('secret note')
+      const list = await call('/position-grants')
+      expect(list.text).not.toContain('secret note')
+      const hist = await call('/position-grant-history')
+      expect(hist.status).toBeGreaterThanOrEqual(400)
+      expect(hist.text).not.toContain('"snapshot"')
+    })
+
+    it('hides notes and history over GraphQL', async () => {
+      const { schema } = configToSchema(p.config)
+      const run = async (source: string) => {
+        const req = await createLocalReq({ user: as(granter) }, p)
+        req.user = as(granter)
+        return graphql({ schema, source, contextValue: { req } })
+      }
+      const grantsRes = await run('{ PositionGrants { docs { id position notes } } }')
+      expect(JSON.stringify(grantsRes)).not.toContain('secret note')
+      expect((grantsRes.data as never as { PositionGrants: { docs: { position: string }[] } }).PositionGrants.docs[0]!.position).toBe('editor')
+      const histRes = await run('{ PositionGrantHistories { docs { id event } } }')
+      expect(histRes.errors?.length ?? 0).toBeGreaterThan(0)
+      expect(JSON.stringify(histRes.data ?? null)).not.toContain('"event"')
+    })
   })
 })
 
