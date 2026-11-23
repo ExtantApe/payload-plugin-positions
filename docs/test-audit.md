@@ -21,6 +21,12 @@ Kept by this repo's owning session, per `~/Code/CLAUDE.md`, "Test self-audits". 
 - Added: resume and extend gates, self-grants, delete refusal, notes access and limits, collection-keyed helpers, history, bulk, REST and GraphQL refusals (46 tests).
 - Skipped: GraphQL and REST success paths (framework behavior).
 
+## 2026-11-23: pending grants and the veto at accept
+
+- Promises: every grant is pending and identical for any holder; the veto runs only at accept and its answer doesn't reach the granter; only the holder or server code accepts; `refuseGrant` is a function or exactly `false`; `{}` and `[]` read answers are no; the revoke-only refusal is Forbidden.
+- Covered: each, in `test/plugin.test.ts` (74 tests), including local API and REST comparisons of a grant to a minor and to an adult on create, resume and extension.
+- Gaps skipped (and why): timing differences between vetoed and unvetoed accepts (no promise made).
+
 ## 2026-11-22: first version
 
 - Promises: fails closed without `canGrant`; host veto; scope and date validation; helpers respect dates; revoke and expiry are final and audited; no deletes; holders read only their own.

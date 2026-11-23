@@ -1,11 +1,16 @@
 # Changelog
 
-## Unreleased
+## Unreleased (for 0.1.1)
 
-- **Veto no longer tells the granter why.** A signed-in person whose grant, resume or extension the host veto refuses now gets the same answer as someone who may not grant at all (the standard not-allowed refusal), with nothing written and no audit event. Before, the veto's reason came back to the granter, which could tell them a grantee is a minor. Server code with no signed-in user still sees the reason.
+- **Behavior change: a grant is pending until the holder accepts, and the veto runs at accept.** Version 0.1.0 ran the veto when a grant, resume or extension was made. A granter got 403 for a minor and 201 for an adult (403 against 200 on resume and extension), which told them who is a minor. Every grant is now saved as `pending`, the same for everyone, and the veto runs when the holder accepts it. The granter never sees the veto's answer. A resume or an extension puts the grant back to `pending`, so the holder accepts again. New `pending` status, new `accept` audit event and history event (`beforeAccept`, `afterAccept`). Hosts must have holders accept grants (set `status: 'active'` as the holder, or from server code) before they count; helpers ignore pending grants. `action` in `refuseGrant` is now always `grant`. The expiry sweep also covers pending grants.
+- A holder can accept or decline (`revoked`) their own pending grant and change nothing else.
+- **`refuseGrant` must be a function or exactly `false`.** `null`, `0`, `''` and other values no longer turn the veto off; they are refused at setup.
+- **A `canRead` or `canReadPrivate` answer of `{}` or `[]` means no**, as in the membership and sharing plugins. Before, `{}` matched every row.
+- A revoke-only user who tries to resume or extend now gets the standard Forbidden answer, not a custom message.
+- Corrected the README, which wrongly said the granter couldn't learn a minor from the veto, and fixed its test count.
 
-Tested: 66 tests, including a same-answer check through the local API and REST for a vetoed grantee, a throwing veto, a resume and an extension.
-Not tested: timing differences between a vetoed and a refused grant.
+Tested: 74 tests. They cover identical status, body, headers and audit events for a grant to a minor and to an adult on create, resume and extension (local API and REST); the veto refusing at accept and the holder's answer not reaching the granter; who may accept or decline; each bad `refuseGrant` value refused at setup; `{}` and `[]` read answers as no; and Forbidden for the revoke-only user.
+Not tested: timing differences between a vetoed and an unvetoed accept; a real app or browser.
 
 ## 0.1.0 (2026-11-23)
 

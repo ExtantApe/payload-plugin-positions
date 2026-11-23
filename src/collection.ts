@@ -17,7 +17,9 @@ import {
 
 const refuse = (message: string) => new APIError(message, 403, undefined, true)
 const GENERAL = 'This position can’t be granted.'
-const LIVE: PositionStatus[] = ['active', 'paused']
+const LIVE: PositionStatus[] = ['pending', 'active', 'paused']
+/** A where from the host counts only when it is a non-empty object. `{}` would match every row and `[]` is not a where, so both mean no. */
+const isWhere = (v: unknown): v is Where => !!v && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length > 0
 /** A date, or a date and a time that carries its zone (`Z` or an offset). A time with no zone would be read in the server's zone, so it is refused. */
 const ISO = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(Z|[+-](\d{2}):?(\d{2})))?$/
 const none = (v: unknown) => v === null || v === undefined || v === ''
@@ -63,7 +65,8 @@ function eventsOf(prev: Shape, next: Shape): AuditName[] {
     if (next.status === 'revoked') out.push('revoke')
     else if (next.status === 'expired') out.push('expire')
     else if (next.status === 'paused') out.push('pause')
-    else if (next.status === 'active') out.push('resume')
+    else if (next.status === 'active') out.push(prev.status === 'pending' ? 'accept' : 'resume')
+    else if (next.status === 'pending' && prev.status === 'paused') out.push('resume')
   } else if (ms(next.endsAt) !== ms(prev.endsAt)) out.push('endDate')
   if (next.status !== prev.status && next.status !== 'revoked' && next.status !== 'expired' && ms(next.endsAt) !== ms(prev.endsAt)) out.push('endDate')
   return out
@@ -99,7 +102,7 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
     try {
       const answer = await opts.canReadPrivate({ req, user, grant })
       if (answer === true) return true
-      return !grant && answer && typeof answer === 'object' ? answer : false
+      return !grant && isWhere(answer) ? answer : false
     } catch {
       return false
     }
@@ -124,11 +127,11 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
   }
 
   /**
-   * The host's veto. Only `null` or nothing goes ahead. A person (a signed-in request) who is vetoed gets the same
-   * answer as one who may not grant at all, so the answer can't tell them who is barred, such as a minor. Server code with
-   * no user still gets the host's reason.
+   * The host's veto, run only when the holder accepts a grant, never when someone grants it, so the granter can't learn
+   * the answer. Only `null` or nothing goes ahead. A person (a signed-in request) who is vetoed gets a plain Forbidden.
+   * Server code with no user still gets the host's reason.
    */
-  async function vetoed(req: PayloadRequest, grant: PositionGrant, action: 'grant' | 'reactivate' | 'extend') {
+  async function vetoed(req: PayloadRequest, grant: PositionGrant, action: 'grant') {
     const veto = opts.refuseGrant
     if (!veto) return
     const no = (reason: string) => (req.user ? new Forbidden(req.t) : refuse(reason))
@@ -186,7 +189,12 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
     },
     access: {
       create: ({ req, data }) => canGrant(req, { data: data as Partial<PositionGrant>, change: 'grant' }),
-      update: ({ req, id, data }) => canRevoke(req, { id, data: data as Partial<PositionGrant> }),
+      update: async ({ req, id, data }) => {
+        if (await canRevoke(req, { id, data: data as Partial<PositionGrant> })) return true
+        // A holder may touch only their own pending grant (to accept or decline it); the hook narrows it further.
+        const user = signedIn(req)
+        return user ? ({ and: [{ holder: { equals: user.id } }, { status: { equals: 'pending' } }] } as Where) : false
+      },
       delete: () => false,
       read: async ({ req }) => {
         const user = signedIn(req)
@@ -194,7 +202,7 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
         if (opts.canRead) {
           try {
             const answer = await opts.canRead({ req, user })
-            return answer === true ? true : answer && typeof answer === 'object' ? answer : false
+            return answer === true ? true : isWhere(answer) ? answer : false
           } catch {
             return false
           }
@@ -226,15 +234,16 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
         name: 'status',
         type: 'select',
         required: true,
-        defaultValue: 'active',
+        defaultValue: 'pending',
         index: true,
         options: [
+          { label: 'Pending acceptance', value: 'pending' },
           { label: 'Active', value: 'active' },
           { label: 'Paused', value: 'paused' },
           { label: 'Revoked', value: 'revoked' },
           { label: 'Expired', value: 'expired' },
         ],
-        admin: { description: 'Revoked and expired are final. A paused grant gives nothing until it is made active again.' },
+        admin: { description: 'A grant is pending until the holder accepts it, and gives nothing until then. Revoked and expired are final. A paused grant gives nothing until it is made active again.' },
       },
       { name: 'revokedAt', type: 'date', admin: { readOnly: true } },
       { name: 'revokedBy', type: 'relationship', relationTo: users as never, admin: { readOnly: true } },
@@ -280,14 +289,14 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
             const e = ms(data.endsAt)
             if (e !== null && e <= now) throw refuse('The end date has already passed.')
             if (s !== null && e !== null && e <= s) throw refuse('The end date must come after the start date.')
-            data.status = 'active'
+            // Every grant starts pending, for everyone. The host veto runs when the holder accepts.
+            data.status = 'pending'
             data.revokedAt = null
             data.revokedBy = null
             data.holder = holder
             const asker = by(req)
             if (asker !== null) data.grantedBy = asker
             const grant = normalize(data)
-            await vetoed(req, grant, 'grant')
             const dup = await req.payload.find({
               collection: GRANTS as never,
               where: {
@@ -334,10 +343,21 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
           if ('notes' in data && (data.notes ?? '') !== (originalDoc.notes ?? '') && req.user && (await readPrivate(req, before)) !== true)
             throw refuse('You can’t change these notes.')
           const status: PositionStatus = (data.status ?? before.status) as PositionStatus
-          if (!['active', 'paused', 'revoked', 'expired'].includes(status)) throw refuse('Unknown status.')
+          if (!['pending', 'active', 'paused', 'revoked', 'expired'].includes(status)) throw refuse('Unknown status.')
           const wasLive = LIVE.includes(before.status)
           const final = 'A revoked or expired grant is final. Make a new one.'
           if (status !== before.status && !wasLive) throw refuse(final)
+          const me0 = signedIn(req)
+          const accepting = before.status === 'pending' && status === 'active'
+          if (accepting) {
+            // Only the holder (or server code with no user) accepts, and the veto runs here.
+            if (req.user && !(me0 && same(me0.id, before.holder))) throw new Forbidden(req.t)
+          }
+          // A holder with no right to revoke may only accept or decline their own pending grant, and change nothing else.
+          if (me0 && same(me0.id, before.holder) && !(await canRevoke(req, { id: before.id, data: data as Partial<PositionGrant> }))) {
+            if (before.status !== 'pending' || (status !== 'active' && status !== 'revoked') || ('endsAt' in data && ms(data.endsAt) !== ms(originalDoc.endsAt))) throw new Forbidden(req.t)
+          }
+          const e0 = ms(originalDoc.endsAt)
           const endChanged = 'endsAt' in data && ms(data.endsAt) !== ms(originalDoc.endsAt)
           if (endChanged && (status === 'revoked' || status === 'expired') && before.status !== status) delete data.endsAt
           else if (endChanged) {
@@ -347,7 +367,7 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
             const s = ms(originalDoc.startsAt)
             if (e !== null && s !== null && e <= s) throw refuse('The end date must come after the start date.')
           }
-          const next = { ...originalDoc, ...data }
+          let next = { ...originalDoc, ...data }
           const o = ms(originalDoc.endsAt)
           const n = ms(next.endsAt)
           const resume = before.status === 'paused' && status === 'active'
@@ -358,10 +378,16 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
             if (me) {
               noSelf(req, before.holder)
               if (!(await canGrant(req, { id: before.id, data: { ...(data as Partial<PositionGrant>), holder: before.holder }, grant: before, change: resume ? 'resume' : 'extend' })))
-                throw refuse('You can’t do that.')
-            } else if (req.user) throw refuse('You can’t do that.')
-            // The veto sees the grant as it would be after the change, so it can judge the new end date.
-            await vetoed(req, { ...normalize({ ...originalDoc, ...data }), id: before.id }, resume ? 'reactivate' : 'extend')
+                throw new Forbidden(req.t)
+            } else if (req.user) throw new Forbidden(req.t)
+            // The grant goes back to pending, whatever the holder is. The veto runs when the holder accepts again.
+            data.status = 'pending'
+            next = { ...originalDoc, ...data }
+          }
+          if (accepting) {
+            if (e0 !== null && e0 <= now) throw refuse('The end date has already passed.')
+            // The veto sees the grant as it stands, so it can judge its end date.
+            await vetoed(req, { ...normalize({ ...originalDoc, ...data }), id: before.id }, 'grant')
           }
           const asker = by(req)
           const merged = normalize(next)
@@ -415,7 +441,7 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
     },
     fields: [
       { name: 'grant', type: 'text', required: true, index: true },
-      { name: 'event', type: 'select', required: true, options: ['grant', 'revoke', 'expire', 'pause', 'resume', 'endDate'] },
+      { name: 'event', type: 'select', required: true, options: ['grant', 'accept', 'revoke', 'expire', 'pause', 'resume', 'endDate'] },
       { name: 'by', type: 'text', admin: { description: 'The signed-in user’s id. Empty for server code and the expiry sweep.' } },
       { name: 'snapshot', type: 'json' },
       { name: 'previous', type: 'json' },

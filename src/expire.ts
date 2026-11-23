@@ -13,7 +13,7 @@ export async function expireGrants(payload: PayloadLike, options: { at?: Date; r
   const at = (options.at ?? new Date()).toISOString()
   const due = await p.find({
     collection: GRANTS as never,
-    where: { and: [{ status: { in: ['active', 'paused'] } }, { endsAt: { less_than_equal: at } }] },
+    where: { and: [{ status: { in: ['pending', 'active', 'paused'] } }, { endsAt: { less_than_equal: at } }] },
     pagination: false,
     depth: 0,
     overrideAccess: true,

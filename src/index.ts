@@ -38,8 +38,8 @@ export const positions =
   (config: Config): Config => {
     if (options.enabled === false) return config
     const users = options.users ?? config.admin?.user ?? 'users'
-    if (options.refuseGrant === undefined)
-      throw new Error('positions: refuseGrant is required. Pass a function, or false to say there is no veto.')
+    if (typeof options.refuseGrant !== 'function' && options.refuseGrant !== false)
+      throw new Error('positions: refuseGrant must be a function, or exactly false to say there is no veto. Nothing else turns it off.')
     const added = positionCollections({ ...options, users, positionTypes: options.positionTypes ?? [], scopeKinds: options.scopeKinds ?? [] })
     return {
       ...config,
