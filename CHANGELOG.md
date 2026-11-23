@@ -8,6 +8,8 @@
 - `PositionStatus` gains `pending`, and `AuditName` gains `accept` (new hooks `beforeAccept` and `afterAccept`, and an `accept` history event).
 - `RefuseArgs.action` is narrower: it is always `grant`, never `resume` or `extend`. A host that switched on it needs no branch for the others.
 - The veto runs when the holder accepts, not when someone grants, resumes or extends.
+- Server code that passes `status: 'pending'` on create or update now gets a 403 error. On create, any other status passed is replaced with `pending`.
+- A `status` that is not one of the five values (`null` and an empty value included) is refused on update, for users and server code.
 
 **Upgrade steps for hosts.**
 
@@ -19,6 +21,11 @@
 
 Changes in this release:
 
+- **A null or unknown status on update is refused.** With `required` dropped from `status`, `{ status: null }` was accepted: the grant stopped counting with no history row, no audit event and no `beforeRevoke`, could not be revoked afterwards (it counted as final), was skipped by the expiry sweep, and kept its live key so a new grant for the same holder, position and scope failed. Any status that is not `pending`, `active`, `paused`, `revoked` or `expired` is now refused over REST, GraphQL and the Local API, for users and server code, single and bulk.
+- The admin create form no longer shows the `status` field, since the plugin sets every new grant to pending. It shows on edit.
+- A `canReadPrivate` where on a field the history rows lack (for example `scopeId`, which is only in `snapshot.scopeId`) returned a 500 on history reads. It now returns no rows.
+- **Tested (sixth review):** 91 tests against a real Payload with in-memory MongoDB: null, empty, unknown and non-string status over the Local API (users and server code), REST single and bulk, GraphQL, and a bulk Local API update, each checking the grant, history and audit are unchanged; the create form condition; a history where on a missing field. 4 of the new tests fail without the fix.
+- **Not tested (sixth review):** the admin create form in a browser, SQL adapters.
 - **A client can't set a grant to `pending`.** A paused grant could be lifted through `pending`: the change skipped `canGrant` and the self-grant check, then the holder accepted. Active to pending also wrote no history row or audit event. A client-set `pending` is now refused on create and update over REST, GraphQL and the Local API, for users and server code. Only the plugin sets it (new grants, resumes, extensions). Re-sending `pending` on a grant that is already pending is allowed.
 - **A `where` from `canRead` or `canReadPrivate` may use only Payload's operators** (equals, not_equals, in, not_in, all, exists, greater_than, greater_than_equal, less_than, less_than_equal, like, not_like, contains, near, within, intersects) plus `and` and `or`. An unknown operator such as `{ scopeId: { bogus: 'x' } }` used to match every row; it is now no.
 - The `status` field has no default and is not required in the schema; the plugin sets `pending` itself on create.

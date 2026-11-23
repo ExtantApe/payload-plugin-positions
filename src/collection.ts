@@ -33,6 +33,14 @@ const isWhere = (v: unknown): v is Where => {
       : !!value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length > 0 && Object.keys(value).every((op) => OPERATORS.has(op)),
   )
 }
+/** The top-level fields a history row has. A where on any other field would be a query error (a 500), so the history answers it with no rows. */
+const HISTORY_FIELDS = new Set(['id', 'createdAt', 'updatedAt', 'grant', 'event', 'by', 'snapshot', 'previous'])
+const usesOnHistory = (w: Where): boolean =>
+  Object.entries(w).every(([key, value]) =>
+    key === 'and' || key === 'or' ? (value as Where[]).every(usesOnHistory) : HISTORY_FIELDS.has(key.split('.')[0]!),
+  )
+const NO_ROWS: Where = { id: { in: [] } }
+const STATUSES = ['pending', 'active', 'paused', 'revoked', 'expired']
 /** A date, or a date and a time that carries its zone (`Z` or an offset). A time with no zone would be read in the server's zone, so it is refused. */
 const ISO = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(Z|[+-](\d{2}):?(\d{2})))?$/
 const none = (v: unknown) => v === null || v === undefined || v === ''
@@ -275,7 +283,11 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
           { label: 'Revoked', value: 'revoked' },
           { label: 'Expired', value: 'expired' },
         ],
-        admin: { description: 'A grant is pending until the holder accepts it, and gives nothing until then. Revoked and expired are final. A paused grant gives nothing until it is made active again.' },
+        admin: {
+          // A new grant always starts pending, set by the plugin, so the create form doesn't offer a status to pick.
+          condition: (data) => Boolean((data as { id?: unknown } | undefined)?.id),
+          description: 'A grant is pending until the holder accepts it, and gives nothing until then. Revoked and expired are final. A paused grant gives nothing until it is made active again.',
+        },
       },
       { name: 'revokedAt', type: 'date', admin: { readOnly: true } },
       { name: 'revokedBy', type: 'relationship', relationTo: users as never, admin: { readOnly: true } },
@@ -388,8 +400,10 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
           // Someone who can't read the notes can't overwrite them either: it would destroy what they can't see.
           if ('notes' in data && (data.notes ?? '') !== (originalDoc.notes ?? '') && req.user && (await readPrivate(req, before)) !== true)
             throw refuse('You can’t change these notes.')
+          // A status that is sent must be one of the five. null or an empty value would end the grant with no history row and no audit event.
+          if ('status' in data && data.status !== undefined && !STATUSES.includes(data.status as string)) throw refuse('Unknown status.')
           const status: PositionStatus = (data.status ?? before.status) as PositionStatus
-          if (!['pending', 'active', 'paused', 'revoked', 'expired'].includes(status)) throw refuse('Unknown status.')
+          if (!STATUSES.includes(status)) throw refuse('Unknown status.')
           const wasLive = LIVE.includes(before.status)
           const final = 'A revoked or expired grant is final. Make a new one.'
           if (status !== before.status && !wasLive) throw refuse(final)
@@ -481,7 +495,10 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
       description: 'Every grant, pause, resume, end-date change, revoke and expiry. Rows are added by the plugin and can’t be changed or deleted.',
     },
     access: {
-      read: ({ req }) => readPrivate(req),
+      read: async ({ req }) => {
+        const answer = await readPrivate(req)
+        return typeof answer === 'object' && !usesOnHistory(answer) ? NO_ROWS : answer
+      },
       create: () => false,
       update: () => false,
       delete: () => false,

@@ -1359,6 +1359,53 @@ describe('fifth review fixes: only the plugin sets pending', () => {
     expect(await status0(g.id)).toBe('active')
     expect((await grants()).totalDocs).toBe(1)
   })
+
+  it('refuses a null, empty or unknown status on update, for users and server code, and the grant is unchanged', async () => {
+    const g = (await live(base())) as never as { id: string }
+    const rows = (await history()).length
+    log.length = 0
+    for (const bad of [null, '', 'bogus', 0, false]) {
+      for (const u of [staff, revoker])
+        expect(await refused(update(g.id, { status: bad }, u)), `${String(bad)} ${String(u.level)}`).toMatch(/unknown status/i)
+      expect(await refused(server(g.id, { status: bad })), String(bad)).toMatch(/unknown status/i)
+      expect(await refused(update(g.id, { status: bad }, alice)), String(bad)).toBeTruthy()
+    }
+    // a bulk update by where goes through the same hook, so it changes nothing
+    const bulk = await payload.update({ collection: 'position-grants' as never, where: { position: { equals: 'editor' } }, data: { status: null } as never, overrideAccess: true })
+    expect(bulk.docs).toHaveLength(0)
+    expect(bulk.errors.length).toBe(1)
+    expect(await status0(g.id)).toBe('active')
+    expect((await history()).length).toBe(rows)
+    expect(log).toEqual([])
+    expect(await hasPosition(payload, as(alice), 'editor', { kind: 'project', id: 'p-1' })).toBe(true)
+    // the grant can still be revoked, so it was not left final
+    await update(g.id, { status: 'revoked' }, revoker)
+    expect(await status0(g.id)).toBe('revoked')
+  })
+
+  it('refuses a null status over REST (single and bulk) and GraphQL, and the grant is unchanged', async () => {
+    const g = (await live(base())) as never as { id: string }
+    const rows = (await history()).length
+    for (const u of [await withEmail(staff), await withEmail(revoker)]) {
+      expect((await api(u, `/position-grants/${g.id}`, 'PATCH', { status: null })).status).toBe(403)
+      expect((await api(u, `/position-grants/${g.id}`, 'PATCH', { status: '' })).status).toBe(403)
+      const bulk = await api(u, '/position-grants?where[position][equals]=editor', 'PATCH', { status: null })
+      expect(bulk.body.docs ?? []).toHaveLength(0)
+      const r = await gql(u, `mutation { updatePositionGrant(id: "${g.id}", data: { status: null }) { id status } }`)
+      expect(r.data?.updatePositionGrant ?? null).toBeNull()
+      expect(r.errors?.length).toBeGreaterThan(0)
+    }
+    expect(await status0(g.id)).toBe('active')
+    expect((await history()).length).toBe(rows)
+    expect(await hasPosition(payload, as(alice), 'editor', { kind: 'project', id: 'p-1' })).toBe(true)
+  })
+
+  it('hides the status field on the create form, where the plugin sets it', () => {
+    const col = payload.config.collections.find((c) => c.slug === 'position-grants')!
+    const field = col.fields.find((f) => (f as { name?: string }).name === 'status') as { admin?: { condition?: (d: unknown) => boolean } }
+    expect(field.admin?.condition?.({})).toBe(false)
+    expect(field.admin?.condition?.({ id: 'abc' })).toBe(true)
+  })
 })
 
 describe('fifth review fixes: where answers use Payload’s operators only', () => {
@@ -1399,6 +1446,47 @@ describe('fifth review fixes: where answers use Payload’s operators only', () 
       expect((await find('position-grants')).totalDocs).toBe(1)
     } finally {
       await close(site, 'bogusop')
+    }
+  })
+})
+
+describe('sixth review fixes: a host where on a field the history lacks', () => {
+  it('returns no history rows, not a 500, and still reads a where on the history’s own fields', async () => {
+    const answer: { v: unknown } = { v: true }
+    const site = await buildConfig({
+      secret: 'test-secret-not-for-production',
+      telemetry: false,
+      typescript: { autoGenerate: false },
+      db: mongooseAdapter({ url: mongo.getUri('histwhere'), transactionOptions: false }),
+      collections: [{ slug: 'users', auth: true, fields: [] }],
+      plugins: [
+        positions({
+          positionTypes: [{ value: 'editor' }],
+          scopeKinds: [{ value: 'project' }],
+          refuseGrant: false,
+          allowWithoutTransactions: true,
+          canGrant: () => true,
+          canReadPrivate: () => answer.v as never,
+        }),
+      ],
+    })
+    try {
+      const p = await getPayload({ config: site, key: 'histwhere' })
+      const u = (await p.create({ collection: 'users', data: { email: 'a@example.com', password: PW } as never })) as unknown as U
+      const h = (await p.create({ collection: 'users', data: { email: 'b@example.com', password: PW } as never })) as unknown as U
+      await p.create({ collection: 'position-grants' as never, data: { holder: h.id, position: 'editor', scopeKind: 'project', scopeId: 'a' } as never, user: as(u), overrideAccess: false })
+      const find = () => p.find({ collection: 'position-grant-history' as never, user: as(u), overrideAccess: false })
+      expect((await find()).totalDocs).toBe(1)
+      for (const w of [{ scopeId: { equals: 'a' } }, { or: [{ event: { equals: 'grant' } }, { scopeKind: { equals: 'project' } }] }]) {
+        answer.v = w
+        expect((await find()).totalDocs, JSON.stringify(w)).toBe(0)
+      }
+      answer.v = { 'snapshot.scopeId': { equals: 'a' } }
+      expect((await find()).totalDocs).toBe(1)
+      answer.v = { and: [{ event: { equals: 'grant' } }, { 'snapshot.scopeId': { equals: 'b' } }] }
+      expect((await find()).totalDocs).toBe(0)
+    } finally {
+      await close(site, 'histwhere')
     }
   })
 })

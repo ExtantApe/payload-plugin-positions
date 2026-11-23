@@ -2,6 +2,12 @@
 
 Kept by this repo's owning session, per `~/Code/CLAUDE.md`, "Test self-audits". Newest first.
 
+## 2026-11-23: sixth review fixes
+
+- Promises checked: a grant only changes status to one of the five values, over every API, for users and server code, single and bulk; a history read with a host where on a missing field returns no rows; the create form doesn't offer a status.
+- Added: null, empty, unknown and non-string status (Local API with users and server code, bulk Local API, REST single and bulk, GraphQL) with the grant, history and audit unchanged and the grant still revocable; the create form condition; a history where on a field the history lacks, and where on its own fields (91 tests). Checked by reverting the fix: 4 of the new tests fail.
+- Skipped: the admin form in a browser (none here), SQL adapters.
+
 ## 2026-11-23: fifth review fixes
 
 - Promises checked: only the plugin sets pending; a pause can't be lifted without `canGrant`, the self-grant check and the veto; a host `where` uses Payload's operators only.
