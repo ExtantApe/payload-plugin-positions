@@ -18,10 +18,21 @@ import {
 const refuse = (message: string) => new APIError(message, 403, undefined, true)
 const GENERAL = 'This position can’t be granted.'
 const LIVE: PositionStatus[] = ['active', 'paused']
-const ISO = /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/
+/** A date, or a date and a time that carries its zone (`Z` or an offset). A time with no zone would be read in the server's zone, so it is refused. */
+const ISO = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(Z|[+-](\d{2}):?(\d{2})))?$/
 const none = (v: unknown) => v === null || v === undefined || v === ''
-/** A date as milliseconds, null for no date, and NaN for anything that isn't an ISO date string or a Date (so `0` and `'1'` are bad dates, not no date). */
-const ms = (v: unknown): number | null => (none(v) ? null : v instanceof Date ? v.getTime() : typeof v === 'string' && ISO.test(v) ? Date.parse(v) : Number.NaN)
+/** True when the string is a real calendar date and time, so `2026-02-30` is refused instead of rolling over to 2 March. */
+function realIso(v: string): boolean {
+  const m = ISO.exec(v)
+  if (!m) return false
+  const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])]
+  const day = new Date(Date.UTC(y, mo - 1, d))
+  if (day.getUTCFullYear() !== y || day.getUTCMonth() !== mo - 1 || day.getUTCDate() !== d) return false
+  if (m[4] !== undefined && (Number(m[4]) > 23 || Number(m[5]) > 59 || (m[6] !== undefined && Number(m[6]) > 59))) return false
+  if (m[8] !== undefined && (Number(m[8]) > 23 || Number(m[9]) > 59)) return false
+  return true
+}
+const ms = (v: unknown): number | null => (none(v) ? null : v instanceof Date ? v.getTime() : typeof v === 'string' && realIso(v) ? Date.parse(v) : Number.NaN)
 const dateOk = (v: unknown) => none(v) || !Number.isNaN(ms(v))
 const same = (a: unknown, b: unknown) => a !== null && a !== undefined && b !== null && b !== undefined && String(a) === String(b)
 
@@ -122,7 +133,8 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
     if (!holder) throw refuse(GENERAL)
     let why: unknown
     try {
-      why = await veto({ req, holder: holder as never, grant, action })
+      // No end date is always null, never missing, so a veto can tell "no end" from a field it forgot to read.
+      why = await veto({ req, holder: holder as never, grant: { ...grant, endsAt: none(grant.endsAt) ? null : grant.endsAt } as PositionGrant, action })
     } catch {
       throw refuse(GENERAL)
     }
@@ -225,7 +237,8 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
         name: 'notes',
         type: 'textarea',
         maxLength: 2000,
-        access: { read: async ({ req, doc }) => (await readPrivate(req, normalize((doc ?? {}) as Record<string, unknown>))) === true },
+        // With no document (a `where` on notes), the answer is no: filtering would show which rows match.
+        access: { read: async ({ req, doc }) => (doc ? (await readPrivate(req, normalize(doc as Record<string, unknown>))) === true : false) },
         admin: { description: 'Only people the host allows can read these (canReadPrivate). The holder can’t.' },
       },
       // Makes a second live grant for the same holder, position and scope fail in the database, not just in a check.
@@ -282,6 +295,9 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
                 ],
               },
               limit: 20,
+              // No page count: Payload's Mongo adapter sends the find and its count at once, and when this is the first
+              // query in the transaction the two race to start it (NoSuchTransaction). We don't need the total.
+              pagination: false,
               depth: 0,
               overrideAccess: true,
               req,

@@ -108,7 +108,7 @@ export type PositionsOptions = {
    * `true`. For the history it is called with no grant, and may answer `true` or a Payload `where` on the history rows
    * (`snapshot.scopeKind`, `snapshot.scopeId`, `snapshot.holder` and so on) to narrow what is visible.
    */
-  canReadPrivate?: (args: { req: PayloadRequest; user: AccessArgs['user']; grant?: PositionGrant }) => boolean | Where | Promise<boolean | Where>
+  canReadPrivate?: (args: { req: PayloadRequest; user: AccessArgs['user']; grant: PositionGrant | undefined }) => boolean | Where | Promise<boolean | Where>
   /**
    * The plugin writes the history in the same database transaction as the grant, so a history failure undoes the
    * change. Without transactions it can't promise that, so it refuses every change. Set true only if you accept a
