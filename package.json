@@ -1,0 +1,61 @@
+{
+  "name": "@extantape/payload-plugin-positions",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Positions for Payload: named roles people hold in an organization, for business accounts. A skeleton; the scope is still to come.",
+  "keywords": [
+    "payload",
+    "payload-plugin",
+    "payloadcms",
+    "positions",
+    "roles",
+    "organizations",
+    "business-accounts",
+    "access-control"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/ExtantApe/payload-plugin-positions#readme",
+  "bugs": {
+    "url": "https://github.com/ExtantApe/payload-plugin-positions/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ExtantApe/payload-plugin-positions.git"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run typecheck && npm test"
+  },
+  "peerDependencies": {
+    "payload": "^3.80.0"
+  },
+  "devDependencies": {
+    "@payloadcms/db-mongodb": "3.92.1",
+    "@types/node": "^24.0.0",
+    "graphql": "^16.14.2",
+    "mongodb-memory-server": "^11.3.0",
+    "payload": "3.92.1",
+    "typescript": "^5.9.0",
+    "vitest": "^5.1.0"
+  }
+}
