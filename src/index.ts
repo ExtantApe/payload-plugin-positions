@@ -1,6 +1,6 @@
 import type { Config, Plugin } from 'payload'
 
-import { positionGrantsCollection } from './collection.js'
+import { positionCollections } from './collection.js'
 import type { PositionsOptions } from './types.js'
 
 export { expireGrants } from './expire.js'
@@ -17,6 +17,12 @@ export const positions =
   (config: Config): Config => {
     if (options.enabled === false) return config
     const users = options.users ?? config.admin?.user ?? 'users'
-    const collection = positionGrantsCollection({ ...options, users, positionTypes: options.positionTypes ?? [], scopeKinds: options.scopeKinds ?? [] })
-    return { ...config, collections: [...(config.collections ?? []), collection] }
+    if (options.refuseGrant === undefined)
+      throw new Error('positions: refuseGrant is required. Pass a function, or false to say there is no veto.')
+    const added = positionCollections({ ...options, users, positionTypes: options.positionTypes ?? [], scopeKinds: options.scopeKinds ?? [] })
+    return {
+      ...config,
+      collections: [...(config.collections ?? []), ...added],
+      custom: { ...config.custom, positionsUsers: users },
+    }
   }

@@ -1,6 +1,7 @@
 import type { Payload, PayloadRequest, Where } from 'payload'
 
 export const GRANTS = 'position-grants'
+export const HISTORY = 'position-grant-history'
 
 export type PositionStatus = 'active' | 'paused' | 'revoked' | 'expired'
 
@@ -37,8 +38,14 @@ export type PositionGrant = {
 export type AccessArgs = {
   req: PayloadRequest
   user: { id: string | number; collection?: string } & Record<string, unknown>
-  /** The grant being created. Only set when the question is about a new grant. */
+  /** The change being made: the new grant's data, or the fields of an update. The holder is always a plain id. */
   data?: Partial<PositionGrant>
+  /** The id of the grant being changed, for an update. */
+  id?: string | number
+  /** The grant as it is now, when the question is about changing one. Set for `resume` and `extend`. */
+  grant?: PositionGrant
+  /** What is being asked: a new `grant`, a paused grant switched back on (`resume`), or an end date moved later or removed (`extend`). */
+  change?: 'grant' | 'resume' | 'extend'
 }
 
 export type RefuseArgs = {
@@ -46,12 +53,14 @@ export type RefuseArgs = {
   /** The holder's user document. */
   holder: Record<string, unknown> & { id: string | number }
   grant: PositionGrant
-  /** `grant` for a new grant, `reactivate` when a paused grant is switched back on. */
-  action: 'grant' | 'reactivate'
+  /** `grant` for a new grant, `reactivate` when a paused grant is switched back on, `extend` when its end date is moved later or removed. */
+  action: 'grant' | 'reactivate' | 'extend'
 }
 
+export type AuditName = 'grant' | 'revoke' | 'expire' | 'pause' | 'resume' | 'endDate'
+
 export type AuditEvent = {
-  event: 'grant' | 'revoke' | 'expire'
+  event: AuditName
   phase: 'before' | 'after'
   grant: PositionGrant
   /** The grant as it was before a revoke or expiry. Absent for a grant. */
@@ -62,6 +71,8 @@ export type AuditEvent = {
 }
 
 export type AuditHook = (event: AuditEvent) => void | Promise<void>
+
+export type RefuseFn = (args: RefuseArgs) => string | null | undefined | Promise<string | null | undefined>
 
 export type PositionsOptions = {
   /** Turn the plugin off without removing it. Default true. */
@@ -77,7 +88,7 @@ export type PositionsOptions = {
    * the new grant's data when a grant is created.
    */
   canGrant?: (args: AccessArgs) => boolean | Promise<boolean>
-  /** Who may revoke, pause or change a grant's end date. Default: whoever `canGrant` allows. Fails closed the same way. */
+  /** Who may revoke, pause or shorten a grant. Default: whoever `canGrant` allows. Fails closed the same way. Resuming a grant or moving its end date later or to none always needs `canGrant` too, and the veto. */
   canRevoke?: (args: AccessArgs) => boolean | Promise<boolean>
   /**
    * Who may read grants. Default: anyone `canGrant` allows reads all; everyone else reads only their own. May return a
@@ -86,10 +97,11 @@ export type PositionsOptions = {
   canRead?: (args: Omit<AccessArgs, 'data'>) => boolean | Where | Promise<boolean | Where>
   /**
    * A veto the host controls, asked on every grant and when a paused grant is switched back on, even for server code
-   * that skips access. Return `null` (or nothing) to go ahead, or a reason to refuse. A throw, `false` or anything else
+   * that skips access. Required: pass `false` to say there is no veto. The reason is shown to the person who tried, so
+   * don't put anything private in it. Return `null` (or nothing) to go ahead, or a reason to refuse. A throw, `false` or anything else
    * also refuses, with a general reason.
    */
-  refuseGrant?: (args: RefuseArgs) => string | null | undefined | Promise<string | null | undefined>
+  refuseGrant: RefuseFn | false
   /** Audit hooks. A `before` hook that throws stops the change. An `after` hook that throws is logged and ignored. */
   audit?: {
     beforeGrant?: AuditHook
@@ -98,7 +110,15 @@ export type PositionsOptions = {
     afterRevoke?: AuditHook
     beforeExpire?: AuditHook
     afterExpire?: AuditHook
+    beforePause?: AuditHook
+    afterPause?: AuditHook
+    beforeResume?: AuditHook
+    afterResume?: AuditHook
+    beforeEndDateChange?: AuditHook
+    afterEndDateChange?: AuditHook
   }
+  /** Let people grant positions to themselves. Default false: a person can't grant, resume or extend their own. */
+  allowSelfGrant?: boolean
   /** The admin group the collection sits in. Default `Accounts`. */
   adminGroup?: string
 }

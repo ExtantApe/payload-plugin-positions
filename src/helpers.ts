@@ -42,9 +42,22 @@ export type HelperOptions = {
   req?: PayloadRequest
 }
 
+/**
+ * The holder id for a user. A signed-in user (which carries its auth collection) counts only if it comes from the
+ * users collection the plugin was set up with, so an id from another collection can't match. A bare id is taken as a
+ * users id. A document with no collection is not accepted.
+ */
+function holderOf(p: Payload, user: unknown): string | number | null {
+  if (user && typeof user === 'object') {
+    const slug = (p.config.custom as { positionsUsers?: string } | undefined)?.positionsUsers ?? 'users'
+    if ((user as { collection?: unknown }).collection !== slug) return null
+  }
+  return idOf(user)
+}
+
 async function liveGrants(payload: PayloadLike, user: unknown, options: HelperOptions) {
   const p = payloadOf(payload)
-  const holder = idOf(user)
+  const holder = holderOf(p, user)
   if (holder === null) return []
   const found = await p.find({
     collection: GRANTS as never,
@@ -71,7 +84,7 @@ export async function positionsOf(payload: PayloadLike, user: unknown, options: 
 }
 
 /**
- * Whether a user holds a position now (or at `at`). Give a scope to match a scoped grant exactly, or leave it out to
+ * Whether a user holds a position now. The user is a signed-in user (`req.user`) or an id (or at `at`). Give a scope to match a scoped grant exactly, or leave it out to
  * match an unscoped grant. A grant on one record never answers for another. No user, a paused, revoked or expired
  * grant, a date outside its window, or any error reading the grants is a no.
  */

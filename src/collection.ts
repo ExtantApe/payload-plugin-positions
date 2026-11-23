@@ -1,11 +1,15 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
+
 import { APIError, type CollectionConfig, type PayloadRequest } from 'payload'
 
 import { idOf } from './helpers.js'
 import {
   GRANTS,
+  HISTORY,
   type AccessArgs,
   type AuditEvent,
   type AuditHook,
+  type AuditName,
   type PositionGrant,
   type PositionStatus,
   type PositionsOptions,
@@ -16,6 +20,10 @@ const GENERAL = 'This position can’t be granted.'
 const LIVE: PositionStatus[] = ['active', 'paused']
 const dateOk = (v: unknown) => v === null || v === undefined || v === '' || !Number.isNaN(Date.parse(String(v)))
 const ms = (v: unknown) => (v ? Date.parse(String(v)) : null)
+const same = (a: unknown, b: unknown) => a !== null && a !== undefined && b !== null && b !== undefined && String(a) === String(b)
+
+/** Only the plugin's own code may add a history row. */
+const writingHistory = new AsyncLocalStorage<true>()
 
 /** Only an exact `true` passes. A throw, a rejection or any other answer is a no. */
 async function exactlyTrue(check: () => unknown): Promise<boolean> {
@@ -33,21 +41,40 @@ const normalize = (doc: Record<string, unknown>): PositionGrant => ({
   revokedBy: idOf(doc.revokedBy),
 })
 
-export function positionGrantsCollection(opts: Required<Pick<PositionsOptions, 'users' | 'positionTypes' | 'scopeKinds'>> & PositionsOptions): CollectionConfig {
+type Shape = { status?: unknown; endsAt?: unknown }
+/** The audit events a change amounts to. */
+function eventsOf(prev: Shape, next: Shape): AuditName[] {
+  const out: AuditName[] = []
+  if (next.status !== prev.status) {
+    if (next.status === 'revoked') out.push('revoke')
+    else if (next.status === 'expired') out.push('expire')
+    else if (next.status === 'paused') out.push('pause')
+    else if (next.status === 'active') out.push('resume')
+  } else if (ms(next.endsAt) !== ms(prev.endsAt)) out.push('endDate')
+  if (next.status !== prev.status && next.status !== 'revoked' && next.status !== 'expired' && ms(next.endsAt) !== ms(prev.endsAt)) out.push('endDate')
+  return out
+}
+const hookName = (phase: 'before' | 'after', event: AuditName) =>
+  `${phase}${event === 'endDate' ? 'EndDateChange' : event[0]!.toUpperCase() + event.slice(1)}` as keyof NonNullable<PositionsOptions['audit']>
+
+export function positionCollections(opts: Required<Pick<PositionsOptions, 'users' | 'positionTypes' | 'scopeKinds'>> & PositionsOptions): CollectionConfig[] {
   const { users, positionTypes, scopeKinds } = opts
   const signedIn = (req: PayloadRequest) => {
     const user = req.user as ({ id: string | number; collection?: string } & Record<string, unknown>) | null
     return user && user.collection === users ? user : null
   }
-  const ask = (fn: PositionsOptions['canGrant'], req: PayloadRequest, data?: Partial<PositionGrant>) => {
+  const ask = (fn: PositionsOptions['canGrant'], req: PayloadRequest, extra: Partial<AccessArgs> = {}) => {
     const user = signedIn(req)
     if (!user || !fn) return false
-    return exactlyTrue(() => fn({ req, user, data } as AccessArgs))
+    const data = extra.data ? { ...extra.data, holder: idOf(extra.data.holder) as string | number } : undefined
+    return exactlyTrue(() => fn({ req, user, ...extra, data }))
   }
-  const canGrant = (req: PayloadRequest, data?: Partial<PositionGrant>) => ask(opts.canGrant, req, data)
-  const canRevoke = (req: PayloadRequest) => ask(opts.canRevoke ?? opts.canGrant, req)
+  const canGrant = (req: PayloadRequest, extra: Partial<AccessArgs> = {}) => ask(opts.canGrant, req, extra)
+  const canRevoke = (req: PayloadRequest, extra: Partial<AccessArgs> = {}) => ask(opts.canRevoke ?? opts.canGrant, req, extra)
+  const by = (req: PayloadRequest) => idOf(req.user)
 
-  const run = async (hook: AuditHook | undefined, event: AuditEvent, mustPass: boolean) => {
+  const run = async (name: keyof NonNullable<PositionsOptions['audit']>, event: AuditEvent, mustPass: boolean) => {
+    const hook: AuditHook | undefined = opts.audit?.[name]
     if (!hook) return
     try {
       await hook(event)
@@ -56,18 +83,18 @@ export function positionGrantsCollection(opts: Required<Pick<PositionsOptions, '
       event.req.payload.logger.error(`positions: the ${event.event} audit hook failed: ${(error as Error).message}`)
     }
   }
-  const by = (req: PayloadRequest) => idOf(req.user)
 
   /** The host's veto. Only `null` or nothing goes ahead; a reason is shown; anything else is a general refusal. */
-  async function vetoed(req: PayloadRequest, grant: PositionGrant, action: 'grant' | 'reactivate') {
-    if (!opts.refuseGrant) return
+  async function vetoed(req: PayloadRequest, grant: PositionGrant, action: 'grant' | 'reactivate' | 'extend') {
+    const veto = opts.refuseGrant
+    if (!veto) return
     const holder = await req.payload
       .findByID({ collection: users as never, id: grant.holder, depth: 0, overrideAccess: true, req })
       .catch(() => null)
     if (!holder) throw refuse(GENERAL)
     let why: unknown
     try {
-      why = await opts.refuseGrant({ req, holder: holder as never, grant, action })
+      why = await veto({ req, holder: holder as never, grant, action })
     } catch {
       throw refuse(GENERAL)
     }
@@ -75,7 +102,34 @@ export function positionGrantsCollection(opts: Required<Pick<PositionsOptions, '
     throw refuse(typeof why === 'string' && why.trim() ? why : GENERAL)
   }
 
-  return {
+  /** A person can't grant themselves a position unless the host opts in. Server code with no user is not a person. */
+  const noSelf = (req: PayloadRequest, holder: unknown) => {
+    if (opts.allowSelfGrant) return
+    const me = signedIn(req)
+    if (me && same(me.id, idOf(holder))) throw refuse('You can’t do that for your own account.')
+  }
+
+  const snapshot = (g: PositionGrant) => ({
+    holder: g.holder,
+    position: g.position,
+    scopeKind: g.scopeKind ?? null,
+    scopeId: g.scopeId ?? null,
+    startsAt: g.startsAt ?? null,
+    endsAt: g.endsAt ?? null,
+    grantedBy: g.grantedBy ?? null,
+    status: g.status,
+  })
+  const record = (req: PayloadRequest, event: AuditName, grant: PositionGrant, previous?: PositionGrant) =>
+    writingHistory.run(true, () =>
+      req.payload.create({
+        collection: HISTORY as never,
+        data: { grant: String(grant.id), event, by: by(req) === null ? null : String(by(req)), snapshot: snapshot(grant), previous: previous ? snapshot(previous) : null } as never,
+        overrideAccess: true,
+        req,
+      }),
+    )
+
+  const grants: CollectionConfig = {
     slug: GRANTS,
     labels: { singular: 'Position grant', plural: 'Position grants' },
     admin: {
@@ -83,11 +137,11 @@ export function positionGrantsCollection(opts: Required<Pick<PositionsOptions, '
       useAsTitle: 'position',
       defaultColumns: ['holder', 'position', 'scopeKind', 'scopeId', 'status', 'endsAt'],
       description:
-        'Who holds which position, and where. Revoke a grant by setting its status to Revoked; grants are never deleted, so the record stays.',
+        'Who holds which position, and where. Revoke a grant by setting its status to Revoked; grants are never deleted, so the record stays. The history collection keeps every change.',
     },
     access: {
-      create: ({ req, data }) => canGrant(req, data as Partial<PositionGrant>),
-      update: ({ req }) => canRevoke(req),
+      create: ({ req, data }) => canGrant(req, { data: data as Partial<PositionGrant>, change: 'grant' }),
+      update: ({ req, id, data }) => canRevoke(req, { id, data: data as Partial<PositionGrant> }),
       delete: () => false,
       read: async ({ req }) => {
         const user = signedIn(req)
@@ -119,7 +173,7 @@ export function positionGrantsCollection(opts: Required<Pick<PositionsOptions, '
         options: scopeKinds.map((k) => ({ label: k.label ?? k.value, value: k.value })),
         admin: { description: 'What kind of record the position is on. Leave empty for a position that has no scope.' },
       },
-      { name: 'scopeId', type: 'text', index: true, admin: { description: 'The id of that record.' } },
+      { name: 'scopeId', type: 'text', index: true, maxLength: 200, admin: { description: 'The id of that record.' } },
       { name: 'startsAt', type: 'date', admin: { description: 'Empty means from now.', date: { pickerAppearance: 'dayAndTime' } } },
       { name: 'endsAt', type: 'date', admin: { description: 'Empty means no end.', date: { pickerAppearance: 'dayAndTime' } } },
       { name: 'grantedBy', type: 'relationship', relationTo: users as never, admin: { readOnly: true } },
@@ -139,11 +193,22 @@ export function positionGrantsCollection(opts: Required<Pick<PositionsOptions, '
       },
       { name: 'revokedAt', type: 'date', admin: { readOnly: true } },
       { name: 'revokedBy', type: 'relationship', relationTo: users as never, admin: { readOnly: true } },
-      { name: 'notes', type: 'textarea' },
+      {
+        name: 'notes',
+        type: 'textarea',
+        maxLength: 2000,
+        access: { read: ({ req }) => canGrant(req) },
+        admin: { description: 'Only people who can grant can read these. The holder can’t.' },
+      },
       // Makes a second live grant for the same holder, position and scope fail in the database, not just in a check.
       { name: 'liveKey', type: 'text', unique: true, index: true, hidden: true, admin: { disabled: true } },
     ],
     hooks: {
+      beforeDelete: [
+        () => {
+          throw refuse('Grants are never deleted. Revoke the grant instead.')
+        },
+      ],
       beforeChange: [
         async ({ data, originalDoc, operation, req }) => {
           const now = Date.now()
@@ -152,6 +217,7 @@ export function positionGrantsCollection(opts: Required<Pick<PositionsOptions, '
             if (!type) throw refuse('Unknown position.')
             const holder = idOf(data.holder)
             if (holder === null) throw refuse('A grant needs a holder.')
+            noSelf(req, holder)
             if (type.unscoped) {
               if (data.scopeKind || data.scopeId) throw refuse('This position has no scope.')
               data.scopeKind = null
@@ -191,7 +257,7 @@ export function positionGrantsCollection(opts: Required<Pick<PositionsOptions, '
               overrideAccess: true,
               req,
             })
-            // A grant past its end that the sweep hasn't reached yet is expired now, so it doesn't block a fresh one.
+            // A grant past its end that the sweep hasn't reached is expired now, so it doesn't block a fresh one.
             for (const d of dup.docs as unknown as PositionGrant[]) {
               if (d.endsAt && Date.parse(d.endsAt) <= now)
                 await req.payload.update({ collection: GRANTS as never, id: d.id as never, data: { status: 'expired' } as never, overrideAccess: true, req })
@@ -199,7 +265,7 @@ export function positionGrantsCollection(opts: Required<Pick<PositionsOptions, '
             }
             // The database's unique index on this key is what stops two requests at once.
             data.liveKey = JSON.stringify([holder, data.position, data.scopeKind ?? null, data.scopeId ?? null])
-            await run(opts.audit?.beforeGrant, { event: 'grant', phase: 'before', grant, by: asker, req }, true)
+            await run('beforeGrant', { event: 'grant', phase: 'before', grant, by: asker, req }, true)
             return data
           }
 
@@ -217,28 +283,45 @@ export function positionGrantsCollection(opts: Required<Pick<PositionsOptions, '
           const status: PositionStatus = (data.status ?? before.status) as PositionStatus
           if (!['active', 'paused', 'revoked', 'expired'].includes(status)) throw refuse('Unknown status.')
           const wasLive = LIVE.includes(before.status)
-          if (status !== before.status && !wasLive) throw refuse('A revoked or expired grant is final. Make a new one.')
-          if ('endsAt' in data && ms(data.endsAt) !== ms(originalDoc.endsAt)) {
-            if (!wasLive) throw refuse('A revoked or expired grant is final. Make a new one.')
+          const final = 'A revoked or expired grant is final. Make a new one.'
+          if (status !== before.status && !wasLive) throw refuse(final)
+          const endChanged = 'endsAt' in data && ms(data.endsAt) !== ms(originalDoc.endsAt)
+          if (endChanged && (status === 'revoked' || status === 'expired') && before.status !== status) delete data.endsAt
+          else if (endChanged) {
+            if (!wasLive) throw refuse(final)
             if (!dateOk(data.endsAt)) throw refuse('That date isn’t valid.')
             const e = ms(data.endsAt)
             const s = ms(originalDoc.startsAt)
             if (e !== null && s !== null && e <= s) throw refuse('The end date must come after the start date.')
           }
-          if (status === before.status) return data
-          if (status === 'revoked' || status === 'expired') data.liveKey = `ended:${String(originalDoc.id)}`
+          const next = { ...originalDoc, ...data }
+          const o = ms(originalDoc.endsAt)
+          const n = ms(next.endsAt)
+          const resume = before.status === 'paused' && status === 'active'
+          const extend = wasLive && status !== 'revoked' && status !== 'expired' && ms(next.endsAt) !== o && ((n === null && o !== null) || (n !== null && o !== null && n > o))
+          // Giving more than the grant gave before is a grant: it needs canGrant, the veto, and not being your own.
+          if (resume || extend) {
+            const me = signedIn(req)
+            if (me) {
+              noSelf(req, before.holder)
+              if (!(await canGrant(req, { id: before.id, data: { ...(data as Partial<PositionGrant>), holder: before.holder }, grant: before, change: resume ? 'resume' : 'extend' })))
+                throw refuse('You can’t do that.')
+            } else if (req.user) throw refuse('You can’t do that.')
+            await vetoed(req, before, resume ? 'reactivate' : 'extend')
+          }
           const asker = by(req)
-          if (status === 'revoked') {
+          const merged = normalize(next)
+          if (status === 'revoked' && before.status !== 'revoked') {
             data.revokedAt = new Date(now).toISOString()
             data.revokedBy = asker
-            await run(opts.audit?.beforeRevoke, { event: 'revoke', phase: 'before', grant: { ...before, ...normalize({ ...originalDoc, ...data }) }, previous: before, by: asker, req }, true)
-          } else if (status === 'expired') {
-            const e = ms(data.endsAt ?? originalDoc.endsAt)
+            data.liveKey = `ended:${String(originalDoc.id)}`
+          } else if (status === 'expired' && before.status !== 'expired') {
+            const e = ms(next.endsAt)
             if (e === null || e > now) throw refuse('A grant can only expire once its end date has passed.')
-            await run(opts.audit?.beforeExpire, { event: 'expire', phase: 'before', grant: { ...before, status: 'expired' }, previous: before, by: asker, req }, true)
-          } else if (status === 'active') {
-            await vetoed(req, before, 'reactivate')
+            data.liveKey = `ended:${String(originalDoc.id)}`
           }
+          for (const event of eventsOf(before, next))
+            await run(hookName('before', event), { event, phase: 'before', grant: merged, previous: before, by: asker, req }, true)
           return data
         },
       ],
@@ -247,15 +330,56 @@ export function positionGrantsCollection(opts: Required<Pick<PositionsOptions, '
           const grant = normalize(doc)
           const asker = by(req)
           if (operation === 'create') {
-            await run(opts.audit?.afterGrant, { event: 'grant', phase: 'after', grant, by: asker, req }, false)
-          } else if (previousDoc && previousDoc.status !== doc.status) {
+            await record(req, 'grant', grant)
+            await run('afterGrant', { event: 'grant', phase: 'after', grant, by: asker, req }, false)
+          } else if (previousDoc) {
             const previous = normalize(previousDoc)
-            if (doc.status === 'revoked') await run(opts.audit?.afterRevoke, { event: 'revoke', phase: 'after', grant, previous, by: asker, req }, false)
-            if (doc.status === 'expired') await run(opts.audit?.afterExpire, { event: 'expire', phase: 'after', grant, previous, by: asker, req }, false)
+            for (const event of eventsOf(previous, grant)) {
+              await record(req, event, grant, previous)
+              await run(hookName('after', event), { event, phase: 'after', grant, previous, by: asker, req }, false)
+            }
           }
           return doc
         },
       ],
     },
   }
+
+  const history: CollectionConfig = {
+    slug: HISTORY,
+    labels: { singular: 'Position grant history', plural: 'Position grant history' },
+    admin: {
+      group: opts.adminGroup ?? 'Accounts',
+      defaultColumns: ['grant', 'event', 'by', 'createdAt'],
+      description: 'Every grant, pause, resume, end-date change, revoke and expiry. Rows are added by the plugin and can’t be changed or deleted.',
+    },
+    access: {
+      read: ({ req }) => canGrant(req),
+      create: () => false,
+      update: () => false,
+      delete: () => false,
+    },
+    fields: [
+      { name: 'grant', type: 'text', required: true, index: true },
+      { name: 'event', type: 'select', required: true, options: ['grant', 'revoke', 'expire', 'pause', 'resume', 'endDate'] },
+      { name: 'by', type: 'text', admin: { description: 'The signed-in user’s id. Empty for server code and the expiry sweep.' } },
+      { name: 'snapshot', type: 'json' },
+      { name: 'previous', type: 'json' },
+    ],
+    hooks: {
+      beforeChange: [
+        ({ data, operation }) => {
+          if (operation !== 'create' || !writingHistory.getStore()) throw refuse('The history is only written by the plugin.')
+          return data
+        },
+      ],
+      beforeDelete: [
+        () => {
+          throw refuse('The history is never deleted.')
+        },
+      ],
+    },
+  }
+
+  return [grants, history]
 }
