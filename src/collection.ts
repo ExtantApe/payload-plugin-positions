@@ -140,6 +140,8 @@ export function positionGrantsCollection(opts: Required<Pick<PositionsOptions, '
       { name: 'revokedAt', type: 'date', admin: { readOnly: true } },
       { name: 'revokedBy', type: 'relationship', relationTo: users as never, admin: { readOnly: true } },
       { name: 'notes', type: 'textarea' },
+      // Makes a second live grant for the same holder, position and scope fail in the database, not just in a check.
+      { name: 'liveKey', type: 'text', unique: true, index: true, hidden: true, admin: { disabled: true } },
     ],
     hooks: {
       beforeChange: [
@@ -189,8 +191,14 @@ export function positionGrantsCollection(opts: Required<Pick<PositionsOptions, '
               overrideAccess: true,
               req,
             })
-            if ((dup.docs as unknown as PositionGrant[]).some((d) => !d.endsAt || Date.parse(d.endsAt) > now))
-              throw refuse('That account already holds this position here.')
+            // A grant past its end that the sweep hasn't reached yet is expired now, so it doesn't block a fresh one.
+            for (const d of dup.docs as unknown as PositionGrant[]) {
+              if (d.endsAt && Date.parse(d.endsAt) <= now)
+                await req.payload.update({ collection: GRANTS as never, id: d.id as never, data: { status: 'expired' } as never, overrideAccess: true, req })
+              else throw refuse('That account already holds this position here.')
+            }
+            // The database's unique index on this key is what stops two requests at once.
+            data.liveKey = JSON.stringify([holder, data.position, data.scopeKind ?? null, data.scopeId ?? null])
             await run(opts.audit?.beforeGrant, { event: 'grant', phase: 'before', grant, by: asker, req }, true)
             return data
           }
@@ -205,6 +213,7 @@ export function positionGrantsCollection(opts: Required<Pick<PositionsOptions, '
           }
           delete data.revokedAt
           delete data.revokedBy
+          delete data.liveKey
           const status: PositionStatus = (data.status ?? before.status) as PositionStatus
           if (!['active', 'paused', 'revoked', 'expired'].includes(status)) throw refuse('Unknown status.')
           const wasLive = LIVE.includes(before.status)
@@ -217,6 +226,7 @@ export function positionGrantsCollection(opts: Required<Pick<PositionsOptions, '
             if (e !== null && s !== null && e <= s) throw refuse('The end date must come after the start date.')
           }
           if (status === before.status) return data
+          if (status === 'revoked' || status === 'expired') data.liveKey = `ended:${String(originalDoc.id)}`
           const asker = by(req)
           if (status === 'revoked') {
             data.revokedAt = new Date(now).toISOString()

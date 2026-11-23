@@ -138,6 +138,20 @@ describe('granting', () => {
     expect((await grants()).totalDocs).toBe(3)
   })
 
+  it('lets only one of several simultaneous identical grants through', async () => {
+    const results = await Promise.allSettled(Array.from({ length: 6 }, () => grant(base())))
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1)
+    expect((await grants()).totalDocs).toBe(1)
+  })
+
+  it('lets a grant be made again once the old one is expired, even before the sweep', async () => {
+    await grant({ ...base(), endsAt: iso(700) })
+    await new Promise((r) => setTimeout(r, 900))
+    await grant(base())
+    const all = (await grants()).docs as unknown as { status: string }[]
+    expect(all.map((g) => g.status).sort()).toEqual(['active', 'expired'])
+  })
+
   it('refuses bad dates', async () => {
     expect(await refused(grant({ ...base(), endsAt: iso(-DAY) }))).toMatch(/already passed/)
     expect(await refused(grant({ ...base(), startsAt: iso(2 * DAY), endsAt: iso(DAY) }))).toMatch(/after the start/)

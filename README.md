@@ -2,7 +2,7 @@
 
 Positions for Payload: scoped grants that open tools or portals, held in one `position-grants` collection. The host names the position types and scope kinds and decides who may grant. Nobody can grant until it does.
 
-**Status:** early, 0.x, not on npm yet. The 29 tests run against a real Payload with an in-memory MongoDB. It hasn't been tried in a real app, and the admin screens haven't been looked at in a browser.
+**Status:** early, 0.x, not on npm yet. The 31 tests run against a real Payload with an in-memory MongoDB. It hasn't been tried in a real app, and the admin screens haven't been looked at in a browser.
 
 ## What it does
 
@@ -12,7 +12,7 @@ Positions for Payload: scoped grants that open tools or portals, held in one `po
 - **Host veto.** `refuseGrant` can block a grant for any reason (the host decides). It also runs when a paused grant is switched back on, and for server code that skips access.
 - **Audit hooks** before and after grant, revoke and expiry. A failing `before` hook stops the change. A failing `after` hook is logged.
 - **Helpers** that respect start and end dates: `hasPosition` and `positionsOf`.
-- One live grant per holder, position and scope.
+- One live grant per holder, position and scope, enforced by a unique index, so two requests at once can't both get in. The database needs to build indexes (Payload's default).
 
 ## Install or build
 
