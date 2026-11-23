@@ -133,7 +133,8 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
     if (!holder) throw refuse(GENERAL)
     let why: unknown
     try {
-      why = await veto({ req, holder: holder as never, grant, action })
+      // No end date is always null, never missing, so a veto can tell "no end" from a field it forgot to read.
+      why = await veto({ req, holder: holder as never, grant: { ...grant, endsAt: none(grant.endsAt) ? null : grant.endsAt } as PositionGrant, action })
     } catch {
       throw refuse(GENERAL)
     }
@@ -236,7 +237,8 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
         name: 'notes',
         type: 'textarea',
         maxLength: 2000,
-        access: { read: async ({ req, doc }) => (await readPrivate(req, doc ? normalize(doc as Record<string, unknown>) : undefined)) === true },
+        // With no document (a `where` on notes), the answer is no: filtering would show which rows match.
+        access: { read: async ({ req, doc }) => (doc ? (await readPrivate(req, normalize(doc as Record<string, unknown>))) === true : false) },
         admin: { description: 'Only people the host allows can read these (canReadPrivate). The holder can’t.' },
       },
       // Makes a second live grant for the same holder, position and scope fail in the database, not just in a check.

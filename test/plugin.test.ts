@@ -39,6 +39,15 @@ const refused = async (p: Promise<unknown>) => {
   }
 }
 const history = async () => (await payload.find({ collection: 'position-grant-history' as never, pagination: false, overrideAccess: true })).docs
+/** Wait for every collection and index of a fresh instance, so the first write doesn't race the index build. */
+const settle = async (p: Payload) => {
+  await Promise.all(Object.values((p.db as unknown as { collections: Record<string, { init: () => Promise<unknown> }> }).collections).map((m) => m.init()))
+}
+/** Close an instance, even one whose start-up failed: a second getPayload on that key skips onInit and hands back the cached entry. */
+const close = async (config: Awaited<ReturnType<typeof buildConfig>>, key: string) => {
+  const p = await getPayload({ config, key, disableOnInit: true }).catch(() => null)
+  await p?.db?.destroy?.()
+}
 const record = (e: AuditEvent) => {
   log.push(`${e.phase}:${e.event}`)
 }
@@ -667,19 +676,42 @@ describe('second review fixes', () => {
     expect((await history()).length).toBe(1)
   })
 
+  const noTxSite = (name: string, allow: boolean) =>
+    buildConfig({
+      secret: 'test-secret-not-for-production',
+      telemetry: false,
+      typescript: { autoGenerate: false },
+      db: mongooseAdapter({ url: mongo.getUri(name), transactionOptions: false }),
+      collections: [{ slug: 'users', auth: true, fields: [] }],
+      plugins: [positions({ positionTypes: [{ value: 'editor' }], scopeKinds: [{ value: 'project' }], refuseGrant: false, canGrant: () => true, allowWithoutTransactions: allow })],
+    })
+
   it('refuses to start when the database has no transactions, unless the host accepts that', async () => {
-    const build = (name: string, allow: boolean) =>
-      buildConfig({
-        secret: 'test-secret-not-for-production',
-        telemetry: false,
-        typescript: { autoGenerate: false },
-        db: mongooseAdapter({ url: mongo.getUri(name), transactionOptions: false }),
-        collections: [{ slug: 'users', auth: true, fields: [] }],
-        plugins: [positions({ positionTypes: [{ value: 'editor' }], scopeKinds: [{ value: 'project' }], refuseGrant: false, canGrant: () => true, allowWithoutTransactions: allow })],
-      })
-    await expect(getPayload({ config: await build('notx', false), key: 'notx' })).rejects.toThrow(/transactions off/)
-    const p = await getPayload({ config: await build('notx-ok', true), key: 'notx-ok' })
-    await p.db.destroy?.()
+    const refusedConfig = await noTxSite('notx', false)
+    const okConfig = await noTxSite('notx-ok', true)
+    try {
+      await expect(getPayload({ config: refusedConfig, key: 'notx' })).rejects.toThrow(/transactions off/)
+      const p = await getPayload({ config: okConfig, key: 'notx-ok' })
+      expect(p.db).toBeTruthy()
+    } finally {
+      await close(refusedConfig, 'notx')
+      await close(okConfig, 'notx-ok')
+    }
+  })
+
+  it('still refuses each change on a database with no transactions when start-up was skipped', async () => {
+    // getPayload({ disableOnInit: true }) skips the start-up check, so the per-request check is what stands behind it.
+    const config = await noTxSite('notx-req', false)
+    try {
+      const p = await getPayload({ config, key: 'notx-req', disableOnInit: true })
+      const u = (await p.create({ collection: 'users', data: { email: 'a@example.com', password: PW } as never })) as unknown as U
+      const h = (await p.create({ collection: 'users', data: { email: 'b@example.com', password: PW } as never })) as unknown as U
+      const data = { holder: h.id, position: 'editor', scopeKind: 'project', scopeId: 'a' } as never
+      expect(await refused(p.create({ collection: 'position-grants' as never, data, user: as(u), overrideAccess: false }))).toMatch(/can’t be done right now/)
+      expect((await p.find({ collection: 'position-grants' as never, overrideAccess: true })).totalDocs).toBe(0)
+    } finally {
+      await close(config, 'notx-req')
+    }
   })
 
   it('checks the adapter for a real transaction: null or undefined refuses, an id is rolled back', async () => {
@@ -703,7 +735,7 @@ describe('follow-ups', () => {
   const update = (id: string, data: Record<string, unknown>, user: U | null = staff) =>
     payload.update({ collection: 'position-grants' as never, id, data: data as never, user: (user ? as(user) : undefined) as never, overrideAccess: false })
 
-  it('shows canReadPrivate no grant at all when there is no document, so a blanket rule can’t open the history by accident', async () => {
+  it('passes canReadPrivate no grant for the history, and doesn’t let anyone filter on notes they can’t read', async () => {
     const calls: unknown[] = []
     const site = await buildConfig({
       secret: 'test-secret-not-for-production',
@@ -725,14 +757,24 @@ describe('follow-ups', () => {
         }),
       ],
     })
-    const p = await getPayload({ config: site, key: 'nogrant' })
-    const u = (await p.create({ collection: 'users', data: { email: 'a@example.com', password: PW } as never })) as unknown as U
-    const h = (await p.create({ collection: 'users', data: { email: 'b@example.com', password: PW } as never })) as unknown as U
-    await p.create({ collection: 'position-grants' as never, data: { holder: h.id, position: 'editor', scopeKind: 'project', scopeId: 'p-9', notes: 'x' } as never, user: as(u), overrideAccess: false })
-    calls.length = 0
-    await p.find({ collection: 'position-grant-history' as never, user: as(u), overrideAccess: false })
-    expect(calls).toEqual([undefined]) // not a blank grant such as { holder: undefined, ... }
-    await p.db.destroy?.()
+    try {
+      const p = await getPayload({ config: site, key: 'nogrant' })
+      await settle(p)
+      const u = (await p.create({ collection: 'users', data: { email: 'a@example.com', password: PW } as never })) as unknown as U
+      const h = (await p.create({ collection: 'users', data: { email: 'b@example.com', password: PW } as never })) as unknown as U
+      await p.create({ collection: 'position-grants' as never, data: { holder: h.id, position: 'editor', scopeKind: 'project', scopeId: 'p-9', notes: 'x' } as never, user: as(u), overrideAccess: false })
+      calls.length = 0
+      await p.find({ collection: 'position-grant-history' as never, user: as(u), overrideAccess: false })
+      expect(calls).toEqual([undefined]) // not a blank grant such as { holder: undefined, ... }
+      // Filtering on notes would show which rows match, so with no document the answer for notes is no, and the rule isn't asked.
+      calls.length = 0
+      const filtered = await refused(p.find({ collection: 'position-grants' as never, where: { notes: { contains: 'x' } }, user: as(u), overrideAccess: false }))
+      const hits = filtered === null ? (await p.find({ collection: 'position-grants' as never, where: { notes: { contains: 'x' } }, user: as(u), overrideAccess: false })).totalDocs : 0
+      expect(hits).toBe(0)
+      expect(calls).not.toContain(undefined)
+    } finally {
+      await close(site, 'nogrant')
+    }
   })
 
   it('refuses dates that don’t exist and times with no zone, and accepts zoned times', async () => {
@@ -757,17 +799,18 @@ describe('follow-ups', () => {
     }
     await update(g.id, { endsAt: null })
     expect(seenEnds).toHaveLength(1)
-    expect(seenEnds[0] ?? null).toBeNull()
+    expect(seenEnds[0]).toBeNull()
     seenEnds.length = 0
     await grant({ ...base(), scopeId: 'p-2' }) // an open-ended grant, too
     expect(seenEnds).toHaveLength(1)
-    expect(seenEnds[0] ?? null).toBeNull()
+    expect(seenEnds[0]).toBeNull()
   })
 
   describe('with no canReadPrivate, over REST and GraphQL', () => {
     let p: Payload
     let granter: U & { email: string }
     let gid: string
+    let siteConfig: Awaited<ReturnType<typeof buildConfig>> | undefined
     beforeAll(async () => {
       const site = await buildConfig({
         secret: 'test-secret-not-for-production',
@@ -777,14 +820,16 @@ describe('follow-ups', () => {
         collections: [{ slug: 'users', auth: true, fields: [] }],
         plugins: [positions({ positionTypes: [{ value: 'editor' }], scopeKinds: [{ value: 'project' }], refuseGrant: false, canGrant: () => true })],
       })
+      siteConfig = site
       p = await getPayload({ config: site, key: 'noprivate-api' })
+      await settle(p)
       granter = (await p.create({ collection: 'users', data: { email: 'g@example.com', password: PW } as never })) as never
       const h = (await p.create({ collection: 'users', data: { email: 'h@example.com', password: PW } as never })) as unknown as U
       const g = (await p.create({ collection: 'position-grants' as never, data: { holder: h.id, position: 'editor', scopeKind: 'project', scopeId: 'a', notes: 'secret note' } as never, user: as(granter), overrideAccess: false })) as never as { id: string }
       gid = String(g.id)
     })
     afterAll(async () => {
-      await p?.db?.destroy?.()
+      if (siteConfig) await close(siteConfig, 'noprivate-api')
     })
 
     it('hides notes and history over REST', async () => {
