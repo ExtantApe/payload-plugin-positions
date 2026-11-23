@@ -15,7 +15,8 @@ const PW = 'correct-horse-battery'
 let payload: Payload
 let mongo: MongoMemoryReplSet
 const log: string[] = []
-const answers: { canGrant?: () => unknown; refuse?: (a?: never) => unknown; beforeGrant?: () => void } = {}
+const answers: { canGrant?: () => unknown; refuse?: (a?: never) => unknown; beforeGrant?: () => void; beforeAccept?: () => void } = {}
+const accepts: string[] = []
 const seen: { grant?: unknown[]; revoke?: unknown[] } = {}
 const DAY = 86_400_000
 const iso = (offset: number) => new Date(Date.now() + offset).toISOString()
@@ -115,6 +116,13 @@ beforeAll(async () => {
           afterExpire: record,
           beforePause: record,
           afterPause: record,
+          beforeAccept: (e) => {
+            if (answers.beforeAccept) answers.beforeAccept()
+            accepts.push(`${e.phase}:${e.event}`)
+          },
+          afterAccept: (e) => {
+            accepts.push(`${e.phase}:${e.event}`)
+          },
           beforeResume: record,
           afterResume: record,
           beforeEndDateChange: record,
@@ -127,13 +135,18 @@ beforeAll(async () => {
 })
 
 afterAll(async () => {
-  await payload?.db?.destroy?.()
-  await mongo?.stop()
+  // Stop the server and delete its data folder even when destroy throws.
+  try {
+    await payload?.db?.destroy?.()
+  } finally {
+    await mongo?.stop({ doCleanup: true, force: true })
+  }
 })
 
 beforeEach(async () => {
   for (const key of Object.keys(answers)) delete (answers as Record<string, unknown>)[key]
   log.length = 0
+  accepts.length = 0
   delete seen.grant
   delete seen.revoke
   // Grants and history can't be deleted through Payload, so clear the in-memory test database directly.
@@ -232,10 +245,13 @@ describe('fail-closed access', () => {
       collections: [{ slug: 'users', auth: true, fields: [] }],
       plugins: [positions({ positionTypes: [{ value: 'editor' }], scopeKinds: [{ value: 'project' }], refuseGrant: false, allowWithoutTransactions: true })],
     })
-    const p = await getPayload({ config: bare, key: 'bare' })
-    const u = (await p.create({ collection: 'users', data: { email: 'x@example.com', password: PW } as never })) as unknown as U
-    expect(await refused(p.create({ collection: 'position-grants' as never, data: { holder: u.id, position: 'editor', scopeKind: 'project', scopeId: 'a' } as never, user: as(u), overrideAccess: false }))).toBeTruthy()
-    await p.db.destroy?.()
+    try {
+      const p = await getPayload({ config: bare, key: 'bare' })
+      const u = (await p.create({ collection: 'users', data: { email: 'x@example.com', password: PW } as never })) as unknown as U
+      expect(await refused(p.create({ collection: 'position-grants' as never, data: { holder: u.id, position: 'editor', scopeKind: 'project', scopeId: 'a' } as never, user: as(u), overrideAccess: false }))).toBeTruthy()
+    } finally {
+      await close(bare, 'bare')
+    }
   })
 
   it('never lets a grant be deleted, even by staff', async () => {
@@ -606,11 +622,14 @@ describe('review fixes', () => {
       collections: [{ slug: 'users', auth: true, fields: [] }],
       plugins: [positions({ positionTypes: [{ value: 'editor' }], scopeKinds: [{ value: 'project' }], refuseGrant: false, allowSelfGrant: true, allowWithoutTransactions: true, canGrant: () => true })],
     })
-    const p = await getPayload({ config: site, key: 'selfgrant' })
-    const u = (await p.create({ collection: 'users', data: { email: 'me@example.com', password: PW } as never })) as unknown as U
-    const g = await p.create({ collection: 'position-grants' as never, data: { holder: u.id, position: 'editor', scopeKind: 'project', scopeId: 'a' } as never, user: as(u), overrideAccess: false })
-    expect(g).toBeTruthy()
-    await p.db.destroy?.()
+    try {
+      const p = await getPayload({ config: site, key: 'selfgrant' })
+      const u = (await p.create({ collection: 'users', data: { email: 'me@example.com', password: PW } as never })) as unknown as U
+      const g = await p.create({ collection: 'position-grants' as never, data: { holder: u.id, position: 'editor', scopeKind: 'project', scopeId: 'a' } as never, user: as(u), overrideAccess: false })
+      expect(g).toBeTruthy()
+    } finally {
+      await close(site, 'selfgrant')
+    }
   })
 
   it('gives canGrant a plain holder id even when the holder arrives as a document', async () => {
@@ -786,15 +805,18 @@ describe('second review fixes', () => {
       collections: [{ slug: 'users', auth: true, fields: [] }],
       plugins: [positions({ positionTypes: [{ value: 'editor' }], scopeKinds: [{ value: 'project' }], refuseGrant: false, allowWithoutTransactions: true, canGrant: () => true })],
     })
-    const p = await getPayload({ config: site, key: 'noprivate' })
-    const u = (await p.create({ collection: 'users', data: { email: 'a@example.com', password: PW } as never })) as unknown as U
-    const h = (await p.create({ collection: 'users', data: { email: 'b@example.com', password: PW } as never })) as unknown as U
-    await p.create({ collection: 'position-grants' as never, data: { holder: h.id, position: 'editor', scopeKind: 'project', scopeId: 'a', notes: 'secret' } as never, user: as(u), overrideAccess: false })
-    const found = (await p.find({ collection: 'position-grants' as never, user: as(u), overrideAccess: false })).docs[0] as never as Record<string, unknown>
-    expect(found.position).toBe('editor')
-    expect('notes' in found).toBe(false)
-    expect(await refused(p.find({ collection: 'position-grant-history' as never, user: as(u), overrideAccess: false }))).toBeTruthy()
-    await p.db.destroy?.()
+    try {
+      const p = await getPayload({ config: site, key: 'noprivate' })
+      const u = (await p.create({ collection: 'users', data: { email: 'a@example.com', password: PW } as never })) as unknown as U
+      const h = (await p.create({ collection: 'users', data: { email: 'b@example.com', password: PW } as never })) as unknown as U
+      await p.create({ collection: 'position-grants' as never, data: { holder: h.id, position: 'editor', scopeKind: 'project', scopeId: 'a', notes: 'secret' } as never, user: as(u), overrideAccess: false })
+      const found = (await p.find({ collection: 'position-grants' as never, user: as(u), overrideAccess: false })).docs[0] as never as Record<string, unknown>
+      expect(found.position).toBe('editor')
+      expect('notes' in found).toBe(false)
+      expect(await refused(p.find({ collection: 'position-grant-history' as never, user: as(u), overrideAccess: false }))).toBeTruthy()
+    } finally {
+      await close(site, 'noprivate')
+    }
   })
 
   it('undoes a grant when its history row can’t be written', async () => {
@@ -1106,7 +1128,7 @@ describe('plugin', () => {
     expect(() => positions({ positionTypes: [], scopeKinds: [], refuseGrant: false })(config)).not.toThrow()
   })
 
-  it('reads an answer of {} or [] from canRead and canReadPrivate as no', async () => {
+  it('reads anything but true or a real where from canRead and canReadPrivate as no', async () => {
     const answer: { v: unknown } = { v: true }
     const site = await buildConfig({
       secret: 'test-secret-not-for-production',
@@ -1134,15 +1156,91 @@ describe('plugin', () => {
       const find = (col: string) => p.find({ collection: col as never, user: as(u), overrideAccess: false })
       expect((await find('position-grants')).totalDocs).toBe(1) // true still reads
       expect((await find('position-grant-history')).totalDocs).toBe(1)
-      for (const bad of [{}, []]) {
+      for (const bad of [{}, [], { and: [] }, { or: [{}] }, { scopeId: {} }, { scopeId: 'a' }, { scopeId: null }, 'x', 1, false, null, { and: [{ scopeId: { equals: 'a' } }, []] }]) {
         answer.v = bad
         expect(await refused(find('position-grants')), JSON.stringify(bad)).toBeTruthy()
         expect(await refused(find('position-grant-history')), JSON.stringify(bad)).toBeTruthy()
       }
       answer.v = { scopeId: { equals: 'a' } } // a real where still works
       expect((await find('position-grants')).totalDocs).toBe(1)
+      answer.v = { or: [{ scopeId: { equals: 'a' } }, { scopeId: { equals: 'b' } }] }
+      expect((await find('position-grants')).totalDocs).toBe(1)
     } finally {
       await close(site, 'emptywhere')
+    }
+  })
+})
+
+describe('fourth review fixes', () => {
+  const update = (id: string, data: Record<string, unknown>, user: U | null = staff) =>
+    payload.update({ collection: 'position-grants' as never, id: id as never, data: data as never, user: (user ? as(user) : undefined) as never, overrideAccess: false })
+  const historyEvents = async () => (await history()).map((h) => (h as never as { event: string }).event).sort()
+  const scope = { kind: 'project', id: 'p-1' }
+
+  it('keeps a paused grant paused when its end date is moved later or removed', async () => {
+    const g = (await live({ ...base(), endsAt: iso(DAY) })) as never as { id: string }
+    await update(g.id, { status: 'paused' })
+    expect(((await update(g.id, { endsAt: iso(9 * DAY) })) as never as { status: string }).status).toBe('paused')
+    expect(((await update(g.id, { endsAt: null })) as never as { status: string }).status).toBe('paused')
+    expect(await status0(g.id)).toBe('paused')
+    // The holder can't accept a paused grant, so nothing starts again until staff resume it and the holder accepts.
+    expect(await refused(accept(g.id, alice))).toBeTruthy()
+    expect(await hasPosition(payload, as(alice), 'editor', scope)).toBe(false)
+    expect(((await update(g.id, { status: 'active' })) as never as { status: string }).status).toBe('pending')
+    expect(await hasPosition(payload, as(alice), 'editor', scope)).toBe(false)
+    await accept(g.id, alice)
+    expect(await hasPosition(payload, as(alice), 'editor', scope)).toBe(true)
+  })
+
+  it('runs beforeAccept and afterAccept around an accept, once each, and not for a refused accept', async () => {
+    const g = (await grant(base())) as never as { id: string }
+    expect(accepts).toEqual([])
+    answers.refuse = () => 'No.'
+    await refused(accept(g.id, alice))
+    expect(accepts).toEqual([])
+    delete answers.refuse
+    await accept(g.id, alice)
+    expect(accepts).toEqual(['before:accept', 'after:accept'])
+    expect(await historyEvents()).toEqual(['accept', 'grant'])
+  })
+
+  it('stops an accept when beforeAccept fails, and leaves the grant pending', async () => {
+    const g = (await grant(base())) as never as { id: string }
+    answers.beforeAccept = () => {
+      throw new Error('audit store down')
+    }
+    expect(await refused(accept(g.id, alice))).toMatch(/can’t be recorded/)
+    expect(await status0(g.id)).toBe('pending')
+    expect(await historyEvents()).toEqual(['grant'])
+  })
+
+  const clean = /not allowed|just changed|final|can’t be/i
+  it('lets one of several simultaneous accepts through and gives the rest a clean refusal', async () => {
+    for (let round = 0; round < 5; round++) {
+      const g = (await grant({ ...base(), scopeId: `r-${round}` })) as never as { id: string }
+      const out = await Promise.allSettled([accept(g.id, alice), accept(g.id, alice), accept(g.id, alice), accept(g.id, alice)])
+      const won = out.filter((o) => o.status === 'fulfilled')
+      expect(won.length, `round ${round}`).toBe(1)
+      for (const o of out) if (o.status === 'rejected') expect(String((o.reason as Error).message), String(o.reason)).toMatch(clean)
+      for (const o of out) if (o.status === 'rejected') expect((o.reason as { status?: number }).status, String(o.reason)).toBe(403)
+      expect(await status0(g.id)).toBe('active')
+    }
+    expect((await historyEvents()).filter((e) => e === 'accept')).toHaveLength(5)
+  })
+
+  it('settles an accept racing a revoke into one outcome, with a clean refusal for the loser', async () => {
+    for (let round = 0; round < 5; round++) {
+      const g = (await grant({ ...base(), scopeId: `v-${round}` })) as never as { id: string }
+      const out = await Promise.allSettled([accept(g.id, alice), update(g.id, { status: 'revoked' }, revoker)])
+      for (const o of out) if (o.status === 'rejected') {
+        expect(String((o.reason as Error).message), String(o.reason)).toMatch(clean)
+        expect((o.reason as { status?: number }).status).toBe(403)
+      }
+      expect(out.some((o) => o.status === 'fulfilled'), `round ${round}`).toBe(true)
+      const end = await status0(g.id)
+      expect(['active', 'revoked']).toContain(end)
+      const events = (await historyEvents()).length
+      expect(events).toBeGreaterThan(0)
     }
   })
 })

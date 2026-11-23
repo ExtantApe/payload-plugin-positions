@@ -2,6 +2,19 @@
 
 Kept by this repo's owning session, per `~/Code/CLAUDE.md`, "Test self-audits". Newest first.
 
+## 2026-11-23: fourth review fixes
+
+- Promises checked: an extension never undoes a pause; two changes at once give one winner and a clean 403, not a 500; read answers count only as `true`, `false` or a real `where`; the accept hooks run around an accept; the test run leaves no Mongo behind.
+- Added: extending a paused grant (later date, then none), `beforeAccept` and `afterAccept` (order, refused accept, failing hook), four concurrent accepts and accept against revoke over five rounds each, and a wider list of bad read answers (79 tests). Checked by removing the lock: the two concurrency tests fail on a Mongo write conflict.
+- Test hygiene: every extra instance closes in a `finally`; the shared server stops with `doCleanup` and `force` even when closing Payload throws. After two full runs, no `mongod` was left and no `mongo-mem-*` folder from this repo.
+- Skipped: a write conflict on a SQL adapter (no SQL adapter in this repo's tests).
+
+## 2026-11-23: pending grants and the veto at accept
+
+- Promises: every grant is pending and identical for any holder; the veto runs only at accept and its answer doesn't reach the granter; only the holder or server code accepts; `refuseGrant` is a function or exactly `false`; `{}` and `[]` read answers are no; the revoke-only refusal is Forbidden.
+- Covered: each, in `test/plugin.test.ts` (74 tests), including local API and REST comparisons of a grant to a minor and to an adult on create, resume and extension.
+- Gaps skipped (and why): timing differences between vetoed and unvetoed accepts (no promise made).
+
 ## 2026-11-23: after the veto change
 
 - Promise checked: a granter can't tell a vetoed grantee from a grant they may not make.
@@ -20,12 +33,6 @@ Kept by this repo's owning session, per `~/Code/CLAUDE.md`, "Test self-audits". 
 
 - Added: resume and extend gates, self-grants, delete refusal, notes access and limits, collection-keyed helpers, history, bulk, REST and GraphQL refusals (46 tests).
 - Skipped: GraphQL and REST success paths (framework behavior).
-
-## 2026-11-23: pending grants and the veto at accept
-
-- Promises: every grant is pending and identical for any holder; the veto runs only at accept and its answer doesn't reach the granter; only the holder or server code accepts; `refuseGrant` is a function or exactly `false`; `{}` and `[]` read answers are no; the revoke-only refusal is Forbidden.
-- Covered: each, in `test/plugin.test.ts` (74 tests), including local API and REST comparisons of a grant to a minor and to an adult on create, resume and extension.
-- Gaps skipped (and why): timing differences between vetoed and unvetoed accepts (no promise made).
 
 ## 2026-11-22: first version
 

@@ -1,6 +1,24 @@
 # Changelog
 
-## Unreleased (for 0.1.1)
+## Unreleased (for 0.2.0)
+
+**Breaking.** Hosts have to change something to upgrade from 0.1.0:
+
+- A grant is saved as `pending` and gives nothing until the holder accepts it. Anything that made a grant and expected `hasPosition` to be true now needs an accept step.
+- `PositionStatus` gains `pending`, and `AuditName` gains `accept` (new hooks `beforeAccept` and `afterAccept`, and an `accept` history event).
+- `RefuseArgs.action` is narrower: it is always `grant`, never `resume` or `extend`. A host that switched on it needs no branch for the others.
+- The veto runs when the holder accepts, not when someone grants, resumes or extends.
+
+**Upgrade steps for hosts.**
+
+1. Add an accept step: the holder sets their pending grant to `active` (or `revoked` to decline), or server code does it with no user. Nothing else makes a grant count.
+2. Drop code that handled a 403 from the veto on create, resume or extend, and any `action` branch for `resume` or `extend`. The veto's answer now comes back only to the holder at accept, and to server code as the host's reason.
+3. Do not pass the veto's reason on to the granter, and do not accept on the holder's behalf. Either one tells the granter who was refused.
+4. Add `beforeAccept` and `afterAccept` audit hooks if you log the others.
+5. Return only `true`, `false` or a real `where` (at least one condition) from `canRead` and `canReadPrivate`. `{}`, `[]` and any other shape are now refused.
+
+Changes in this release:
+
 
 - **Behavior change: a grant is pending until the holder accepts, and the veto runs at accept.** Version 0.1.0 ran the veto when a grant, resume or extension was made. A granter got 403 for a minor and 201 for an adult (403 against 200 on resume and extension), which told them who is a minor. Every grant is now saved as `pending`, the same for everyone, and the veto runs when the holder accepts it. The granter never sees the veto's answer. A resume or an extension puts the grant back to `pending`, so the holder accepts again. New `pending` status, new `accept` audit event and history event (`beforeAccept`, `afterAccept`). Hosts must have holders accept grants (set `status: 'active'` as the holder, or from server code) before they count; helpers ignore pending grants. `action` in `refuseGrant` is now always `grant`. The expiry sweep also covers pending grants.
 - A holder can accept or decline (`revoked`) their own pending grant and change nothing else.
@@ -8,9 +26,11 @@
 - **A `canRead` or `canReadPrivate` answer of `{}` or `[]` means no**, as in the membership and sharing plugins. Before, `{}` matched every row.
 - A revoke-only user who tries to resume or extend now gets the standard Forbidden answer, not a custom message.
 - Corrected the README, which wrongly said the granter couldn't learn a minor from the veto, and fixed its test count.
+- **Review fixes.** Extending a paused grant (a later end date, or none) now leaves it paused; before, it went to `pending`, and the holder accepting it undid the pause. Two changes to the same grant at once (two accepts, or an accept against a revoke) used to end in a database write conflict and a 500; the loser now gets a plain 403 ("This grant was just changed. Check it and try again."). `canRead` and `canReadPrivate` count a `where` only when it is a real one: every field holds at least one operator and `and` or `or` holds a non-empty list of wheres; `{ field: {} }`, `{ and: [] }`, a bare value and anything else is no. The README warns hosts about relaying the veto's reason and accepting for the holder, and its fails-closed list gives the self-grant message. The test run stops its in-memory MongoDB and deletes its data folder even when closing Payload throws.
 
-Tested: 74 tests. They cover identical status, body, headers and audit events for a grant to a minor and to an adult on create, resume and extension (local API and REST); the veto refusing at accept and the holder's answer not reaching the granter; who may accept or decline; each bad `refuseGrant` value refused at setup; `{}` and `[]` read answers as no; and Forbidden for the revoke-only user.
-Not tested: timing differences between a vetoed and an unvetoed accept; a real app or browser.
+Tested: 79 tests. They cover identical status, body, headers and audit events for a grant to a minor and to an adult on create, resume and extension (local API and REST); the veto refusing at accept and the holder's answer not reaching the granter; who may accept or decline; each bad `refuseGrant` value refused at setup; `{}` and `[]` read answers as no; and Forbidden for the revoke-only user.
+A paused grant that is extended stays paused, and only resume plus an accept brings it back; `beforeAccept` and `afterAccept` run once around an accept, not for a refused accept, and a failing `beforeAccept` stops it; four simultaneous accepts, and an accept against a revoke, five rounds each, give one winner and 403 for the rest (the test fails without the lock); `{ and: [] }`, `{ or: [{}] }`, `{ field: {} }`, bare values and non-objects are refused as read answers, and a real `or` of conditions is allowed. A mutation check (the lock removed) fails both concurrency tests.
+Not tested: timing differences between a vetoed and an unvetoed accept; a write conflict on a SQL adapter (the lock is a plain write; only Mongo ran); a real app or browser.
 
 ## 0.1.0 (2026-11-23)
 

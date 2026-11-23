@@ -18,8 +18,18 @@ import {
 const refuse = (message: string) => new APIError(message, 403, undefined, true)
 const GENERAL = 'This position can’t be granted.'
 const LIVE: PositionStatus[] = ['pending', 'active', 'paused']
-/** A where from the host counts only when it is a non-empty object. `{}` would match every row and `[]` is not a where, so both mean no. */
-const isWhere = (v: unknown): v is Where => !!v && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length > 0
+/** A where from the host counts only when it is a real one: at least one condition, every field holding an operator, and `and` or `or` holding a non-empty list of wheres. `{}`, `[]` and anything else mean no. */
+const isWhere = (v: unknown): v is Where => {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false
+  const entries = Object.entries(v)
+  if (entries.length === 0) return false
+  // `and` and `or` hold a non-empty list of wheres; any other key is a field holding at least one operator.
+  return entries.every(([key, value]) =>
+    key === 'and' || key === 'or'
+      ? Array.isArray(value) && value.length > 0 && value.every(isWhere)
+      : !!value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length > 0,
+  )
+}
 /** A date, or a date and a time that carries its zone (`Z` or an offset). A time with no zone would be read in the server's zone, so it is refused. */
 const ISO = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(Z|[+-](\d{2}):?(\d{2})))?$/
 const none = (v: unknown) => v === null || v === undefined || v === ''
@@ -105,6 +115,26 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
       return !grant && isWhere(answer) ? answer : false
     } catch {
       return false
+    }
+  }
+  /** True for the errors a database gives when two transactions write the same row at once. */
+  const conflict = (e: unknown) => {
+    const x = e as { code?: unknown; codeName?: string; errorLabels?: string[]; hasErrorLabel?: (l: string) => boolean; message?: string }
+    return (
+      x?.code === 112 ||
+      x?.codeName === 'WriteConflict' ||
+      !!x?.errorLabels?.includes('TransientTransactionError') ||
+      (typeof x?.hasErrorLabel === 'function' && x.hasErrorLabel('TransientTransactionError')) ||
+      /write conflict|deadlock|could not serialize|serialization/i.test(String(x?.message ?? ''))
+    )
+  }
+  /** Writes the row once to hold its lock for this transaction. Two changes at once: the second gets a clean refusal. */
+  async function claim(req: PayloadRequest, id: unknown) {
+    try {
+      await req.payload.db.updateOne({ collection: GRANTS as never, id: id as never, data: {} as never, req, returning: false } as never)
+    } catch (e) {
+      if (conflict(e)) throw refuse('This grant was just changed. Check it and try again.')
+      throw e
     }
   }
   /** Writes need a transaction so the history row and the change stand or fall together. */
@@ -329,6 +359,9 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
           }
 
           // An update. Who, what and where never change; a grant that is wrong is revoked and made again.
+          // Take the row's write lock first, so a second change at the same moment is refused here, plainly, and not
+          // as a database error halfway through the save.
+          await claim(req, originalDoc.id)
           const before = normalize(originalDoc)
           for (const f of ['holder', 'position', 'scopeKind', 'scopeId', 'grantedBy', 'startsAt'] as const) {
             if (!(f in data)) continue
@@ -381,7 +414,8 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
                 throw new Forbidden(req.t)
             } else if (req.user) throw new Forbidden(req.t)
             // The grant goes back to pending, whatever the holder is. The veto runs when the holder accepts again.
-            data.status = 'pending'
+            // A paused grant that is only extended stays paused: an extension must not undo the pause.
+            data.status = before.status === 'paused' && status === 'paused' ? 'paused' : 'pending'
             next = { ...originalDoc, ...data }
           }
           if (accepting) {
