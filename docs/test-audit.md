@@ -2,6 +2,12 @@
 
 Kept by this repo's owning session, per `~/Code/CLAUDE.md`, "Test self-audits". Newest first.
 
+## 2026-11-23: after the veto change
+
+- Promise checked: a granter can't tell a vetoed grantee from a grant they may not make.
+- Added: same message and status through the local API and REST, for a veto reason, a throwing veto, a resume and an extension; nothing written and no history row; server code still sees the reason (66 tests).
+- Skipped: timing differences (a vetoed grant does a few more queries); a plugin can't make the host's veto constant-time.
+
 ## 2026-11-23: after the follow-ups
 
 - Promises checked: the plugin refuses to start without transactions and every change still checks its own request; `canReadPrivate` is given no grant when there is no document and can't be used to filter on notes; dates must be real and zoned; the veto sees a null end date; notes and history stay closed over REST and GraphQL when the host gave no `canReadPrivate`.

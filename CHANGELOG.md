@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- **Veto no longer tells the granter why.** A signed-in person whose grant, resume or extension the host veto refuses now gets the same answer as someone who may not grant at all (the standard not-allowed refusal), with nothing written and no audit event. Before, the veto's reason came back to the granter, which could tell them a grantee is a minor. Server code with no signed-in user still sees the reason.
+
+Tested: 66 tests, including a same-answer check through the local API and REST for a vetoed grantee, a throwing veto, a resume and an extension.
+Not tested: timing differences between a vetoed and a refused grant.
+
 ## 0.1.0 (2026-11-23)
 
 - The repo, with the standard Payload plugin kit. Public since 2026-11-22.

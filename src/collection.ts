@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 
-import { APIError, type CollectionConfig, type PayloadRequest, type Where } from 'payload'
+import { APIError, Forbidden, type CollectionConfig, type PayloadRequest, type Where } from 'payload'
 
 import { idOf } from './helpers.js'
 import {
@@ -123,23 +123,28 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
     }
   }
 
-  /** The host's veto. Only `null` or nothing goes ahead; a reason is shown; anything else is a general refusal. */
+  /**
+   * The host's veto. Only `null` or nothing goes ahead. A person (a signed-in request) who is vetoed gets the same
+   * answer as one who may not grant at all, so the answer can't tell them who is barred, such as a minor. Server code with
+   * no user still gets the host's reason.
+   */
   async function vetoed(req: PayloadRequest, grant: PositionGrant, action: 'grant' | 'reactivate' | 'extend') {
     const veto = opts.refuseGrant
     if (!veto) return
+    const no = (reason: string) => (req.user ? new Forbidden(req.t) : refuse(reason))
     const holder = await req.payload
       .findByID({ collection: users as never, id: grant.holder, depth: 0, overrideAccess: true, req })
       .catch(() => null)
-    if (!holder) throw refuse(GENERAL)
+    if (!holder) throw no(GENERAL)
     let why: unknown
     try {
       // No end date is always null, never missing, so a veto can tell "no end" from a field it forgot to read.
       why = await veto({ req, holder: holder as never, grant: { ...grant, endsAt: none(grant.endsAt) ? null : grant.endsAt } as PositionGrant, action })
     } catch {
-      throw refuse(GENERAL)
+      throw no(GENERAL)
     }
     if (why === null || why === undefined) return
-    throw refuse(typeof why === 'string' && why.trim() ? why : GENERAL)
+    throw no(typeof why === 'string' && why.trim() ? why : GENERAL)
   }
 
   /** A person can't grant themselves a position unless the host opts in. Server code with no user is not a person. */

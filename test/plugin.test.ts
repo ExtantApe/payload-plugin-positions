@@ -246,14 +246,35 @@ describe('fail-closed access', () => {
 })
 
 describe('host refusal', () => {
-  it('refuses a grant the host vetoes, with its reason, and audits nothing', async () => {
-    expect(await refused(grant({ ...base(), holder: kid.id }))).toBe('Not available for this account.')
+  it('refuses a grant the host vetoes, writes nothing and audits nothing', async () => {
+    expect(await refused(grant({ ...base(), holder: kid.id }))).toBeTruthy()
     expect((await grants()).totalDocs).toBe(0)
+    expect((await history()).length).toBe(0)
     expect(log).toEqual([])
   })
 
-  it('applies the veto to server code that skips access', async () => {
-    expect(await refused(payload.create({ collection: 'position-grants' as never, data: { ...base(), holder: kid.id } as never, overrideAccess: true }))).toBeTruthy()
+  it('gives the granter the same answer for a vetoed grantee as for a grant they may not make, and never the reason', async () => {
+    const capture = async (p: Promise<unknown>) => {
+      try {
+        await p
+        return null
+      } catch (e) {
+        const err = e as { message: string; status?: number; isPublic?: boolean; data?: unknown }
+        return { message: err.message, status: err.status, data: err.data }
+      }
+    }
+    const barredFromGranting = await capture(grant({ ...base(), holder: alice.id }, other)) // `other` isn't allowed to grant at all
+    const vetoed = await capture(grant({ ...base(), holder: kid.id }))
+    expect(barredFromGranting).not.toBeNull()
+    expect(vetoed).toEqual(barredFromGranting)
+    expect(JSON.stringify(vetoed)).not.toMatch(/Not available|underage|minor/i)
+    // A veto that throws, or answers with something odd, looks the same.
+    answers.refuse = () => { throw new Error('down') }
+    expect(await capture(grant(base()))).toEqual(barredFromGranting)
+  })
+
+  it('applies the veto to server code that skips access, and shows server code the reason', async () => {
+    expect(await refused(payload.create({ collection: 'position-grants' as never, data: { ...base(), holder: kid.id } as never, overrideAccess: true }))).toBe('Not available for this account.')
   })
 
   it('treats a throw, false or a non-string answer as a refusal', async () => {
@@ -268,7 +289,7 @@ describe('host refusal', () => {
     const g = (await grant(base())) as never as { id: string }
     await payload.update({ collection: 'position-grants' as never, id: g.id, data: { status: 'paused' } as never, user: as(staff), overrideAccess: false })
     answers.refuse = () => 'Not available for this account.'
-    expect(await refused(payload.update({ collection: 'position-grants' as never, id: g.id, data: { status: 'active' } as never, user: as(staff), overrideAccess: false }))).toMatch(/Not available/)
+    expect(await refused(payload.update({ collection: 'position-grants' as never, id: g.id, data: { status: 'active' } as never, user: as(staff), overrideAccess: false }))).toBe(await refused(grant(base(), other)))
   })
 
   it('stops a grant when a before-audit hook fails', async () => {
@@ -434,12 +455,12 @@ describe('review fixes', () => {
     seen.grant = []
     seen.revoke = []
     answers.refuse = () => 'Not available for this account.'
-    expect(await refused(update(g.id, { status: 'active' }))).toMatch(/Not available/)
+    expect(await refused(update(g.id, { status: 'active' }))).toBe(await refused(grant(base(), other)))
     await update(g.id, { status: 'active' }).catch(() => null)
     answers.refuse = () => null
     await update(g.id, { status: 'active' })
     answers.refuse = () => 'Not available for this account.'
-    expect(await refused(update(g.id, { endsAt: iso(9 * DAY) }))).toMatch(/Not available/)
+    expect(await refused(update(g.id, { endsAt: iso(9 * DAY) }))).toBe(await refused(grant(base(), other)))
     const asked = (seen.grant as { change?: string; grant?: { id: unknown }; id?: unknown }[]).filter((a) => a.change === 'resume' || a.change === 'extend')
     expect(asked.map((a) => a.change)).toContain('resume')
     expect(asked.map((a) => a.change)).toContain('extend')
@@ -586,6 +607,19 @@ describe('review fixes', () => {
       expect((await grants()).totalDocs).toBe(1)
     })
 
+    it('answers a vetoed grantee over REST exactly as it answers a grant the user may not make', async () => {
+      const asStaff = await withEmail(staff)
+      const asOther = await withEmail(other)
+      const barred = await api(asOther, '/position-grants', 'POST', base())
+      const vetoed = await api(asStaff, '/position-grants', 'POST', { ...base(), holder: kid.id })
+      expect(barred.status).toBe(403)
+      expect(vetoed.status).toBe(barred.status)
+      expect(vetoed.body).toEqual(barred.body)
+      expect(JSON.stringify(vetoed.body)).not.toMatch(/Not available/)
+      expect((await grants()).totalDocs).toBe(0)
+      expect((await history()).length).toBe(0)
+    })
+
     it('refuses a create and a resume over GraphQL', async () => {
       const g = (await grant(base())) as never as { id: string }
       await update(g.id, { status: 'paused' })
@@ -617,7 +651,8 @@ describe('second review fixes', () => {
       const end = (a as unknown as { grant: { endsAt?: string } }).grant.endsAt
       return end && Date.parse(end) > Date.now() + 30 * DAY ? 'Too long.' : null
     }
-    expect(await refused(update(g.id, { endsAt: iso(400 * DAY) }))).toBe('Too long.')
+    const generic = await refused(grant(base(), other))
+    expect(await refused(update(g.id, { endsAt: iso(400 * DAY) }))).toBe(generic) // the veto's reason ('Too long.') isn't shown to a person
     expect(await refused(update(g.id, { endsAt: null }))).toBeNull() // no end: the veto reads no endsAt, as written
     await update(g.id, { endsAt: iso(20 * DAY) })
   })

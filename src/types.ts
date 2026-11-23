@@ -97,8 +97,8 @@ export type PositionsOptions = {
   canRead?: (args: Omit<AccessArgs, 'data'>) => boolean | Where | Promise<boolean | Where>
   /**
    * A veto the host controls, asked on every grant and when a paused grant is switched back on, even for server code
-   * that skips access. Required: pass `false` to say there is no veto. The reason is shown to the person who tried, so
-   * don't put anything private in it. Return `null` (or nothing) to go ahead, or a reason to refuse. A throw, `false` or anything else
+   * that skips access. Required: pass `false` to say there is no veto. The reason is only seen by server code with no signed-in user.
+   * A signed-in person who is vetoed gets the same answer as someone who may not grant at all, so it can't tell them who is barred. Return `null` (or nothing) to go ahead, or a reason to refuse. A throw, `false` or anything else
    * also refuses, with a general reason.
    */
   refuseGrant: RefuseFn | false
