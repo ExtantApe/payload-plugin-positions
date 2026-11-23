@@ -2,6 +2,12 @@
 
 Kept by this repo's owning session, per `~/Code/CLAUDE.md`, "Test self-audits". Newest first.
 
+## 2026-11-23: seventh review fixes
+
+- Promises checked: a refused accept leaves nothing behind, in any update path; a failing history write can't commit a grant change; a host where on a field a collection lacks gives no rows, not a 500; interface labels end with no period.
+- Added: bulk accept refused over the Local API (minor, adult, staff, server code) and REST, with status, `updatedAt`, history and audit unchanged; a single accept by a minor leaves no bump; a failing history write for a single and a bulk update leaves the grant as it was; dotted and unknown fields in host wheres for grants and history; a label check (98 tests). Two older tests changed from expecting per-row errors to expecting the bulk refusal. Checked by reverting the fix: 6 tests fail.
+- Skipped: the admin's edit-selected action in a browser (none here), SQL adapters. A client's own where on an unknown field already gets a 4xx from Payload, so it has a small test and no fix.
+
 ## 2026-11-23: sixth review fixes
 
 - Promises checked: a grant only changes status to one of the five values, over every API, for users and server code, single and bulk; a history read with a host where on a missing field returns no rows; the create form doesn't offer a status.

@@ -707,10 +707,8 @@ describe('review fixes', () => {
     await update(b.id, { status: 'paused' })
     const bulk = (u: U) =>
       payload.update({ collection: 'position-grants' as never, where: { position: { equals: 'editor' } }, data: { status: 'active' } as never, user: as(u), overrideAccess: false })
-    const r1 = (await bulk(revoker)) as never as { docs: unknown[]; errors: unknown[] }
-    expect(r1.docs).toHaveLength(0)
-    expect(r1.errors).toHaveLength(2)
-    expect(((await bulk(other)) as never as { docs: unknown[] }).docs).toHaveLength(0) // not the holder, so nothing matches
+    expect(await refused(bulk(revoker))).toMatch(/one at a time/i)
+    expect(await refused(bulk(other))).toMatch(/one at a time/i)
     expect(await status(a.id)).toBe('paused')
     expect(await status(b.id)).toBe('paused')
   })
@@ -1370,10 +1368,8 @@ describe('fifth review fixes: only the plugin sets pending', () => {
       expect(await refused(server(g.id, { status: bad })), String(bad)).toMatch(/unknown status/i)
       expect(await refused(update(g.id, { status: bad }, alice)), String(bad)).toBeTruthy()
     }
-    // a bulk update by where goes through the same hook, so it changes nothing
-    const bulk = await payload.update({ collection: 'position-grants' as never, where: { position: { equals: 'editor' } }, data: { status: null } as never, overrideAccess: true })
-    expect(bulk.docs).toHaveLength(0)
-    expect(bulk.errors.length).toBe(1)
+    // a bulk update by where is refused outright, so it changes nothing
+    expect(await refused(payload.update({ collection: 'position-grants' as never, where: { position: { equals: 'editor' } }, data: { status: null } as never, overrideAccess: true }))).toMatch(/one at a time/i)
     expect(await status0(g.id)).toBe('active')
     expect((await history()).length).toBe(rows)
     expect(log).toEqual([])
@@ -1488,5 +1484,153 @@ describe('sixth review fixes: a host where on a field the history lacks', () => 
     } finally {
       await close(site, 'histwhere')
     }
+  })
+})
+
+describe('seventh review fixes: no bulk update, no leftover bump, clean refusals', () => {
+  const withEmail = async (u: U) => (await payload.findByID({ collection: 'users', id: u.id })) as never as U
+  const api = async (u: U, path: string, method: string, body?: unknown) => {
+    const token = (await payload.login({ collection: 'users', data: { email: (u as never as { email: string }).email ?? '', password: PW } })).token!
+    const res = await handleEndpoints({
+      config: payload.config as never,
+      request: new Request(`https://site.example/api${path}`, {
+        method,
+        headers: { Authorization: `JWT ${token}`, 'content-type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      }),
+    })
+    return { status: res.status, body: (await res.json()) as Record<string, any> }
+  }
+  const stamps = async (id: string | number) => {
+    const d = (await payload.findByID({ collection: 'position-grants' as never, id: id as never })) as never as { status: string; createdAt: string; updatedAt: string }
+    return { status: d.status, created: d.createdAt, updated: d.updatedAt }
+  }
+  const pendingFor = async (holder: U) => (await grant({ ...base(), holder: holder.id })) as never as { id: string }
+
+  it('refuses a bulk accept through the Local API, for the holder and for server code, and leaves updatedAt alone', async () => {
+    const minor = await pendingFor(kid)
+    const adult = await pendingFor(alice)
+    const rows = (await history()).length
+    const before = [await stamps(minor.id), await stamps(adult.id)]
+    expect(before[0]!.updated).toBe(before[0]!.created)
+    const bulk = (user: U | null) =>
+      payload.update({ collection: 'position-grants' as never, where: { position: { equals: 'editor' } }, data: { status: 'active' } as never, user: (user ? as(user) : undefined) as never, overrideAccess: !user })
+    for (const u of [kid, alice, staff, null]) expect(await refused(bulk(u)), String(u?.level)).toMatch(/one at a time/i)
+    expect([await stamps(minor.id), await stamps(adult.id)]).toEqual(before)
+    expect((await history()).length).toBe(rows)
+    expect(accepts).toEqual([])
+  })
+
+  it('refuses a bulk accept over REST, and updatedAt stays equal to createdAt for a vetoed minor', async () => {
+    const minor = await pendingFor(kid)
+    const adult = await pendingFor(alice)
+    const before = [await stamps(minor.id), await stamps(adult.id)]
+    for (const u of [await withEmail(kid), await withEmail(alice), await withEmail(staff)]) {
+      const res = await api(u, '/position-grants?where[position][equals]=editor', 'PATCH', { status: 'active' })
+      expect(res.status, String(u.level)).toBe(403)
+      expect(res.body.docs ?? []).toHaveLength(0)
+    }
+    expect([await stamps(minor.id), await stamps(adult.id)]).toEqual(before)
+    expect(before[0]!.updated).toBe(before[0]!.created)
+  })
+
+  it('still lets the holder accept one grant by id, and a vetoed minor gets a plain refusal with no bump', async () => {
+    const minor = await pendingFor(kid)
+    const adult = await pendingFor(alice)
+    const mBefore = await stamps(minor.id)
+    expect(await refused(accept(minor.id, kid))).toBeTruthy()
+    expect(await stamps(minor.id)).toEqual(mBefore)
+    expect(((await accept(adult.id, alice)) as never as { status: string }).status).toBe('active')
+  })
+
+  it('leaves the grant unchanged when the history write fails, for one update and for a bulk one', async () => {
+    const adult = await pendingFor(alice)
+    const rows = (await history()).length
+    const before = await stamps(adult.id)
+    const real = payload.create.bind(payload)
+    const spy = vi.spyOn(payload, 'create').mockImplementation(((args: { collection: string }) =>
+      args.collection === 'position-grant-history' ? Promise.reject(new Error('history down')) : real(args as never)) as never)
+    try {
+      expect(await refused(accept(adult.id))).toBeTruthy()
+      const bulk = await payload
+        .update({ collection: 'position-grants' as never, where: { position: { equals: 'editor' } }, data: { status: 'active' } as never, overrideAccess: true })
+        .catch(() => 'refused')
+      expect(bulk === 'refused' || (bulk as { docs: unknown[] }).docs.length === 0).toBe(true)
+    } finally {
+      spy.mockRestore()
+    }
+    expect(await stamps(adult.id)).toEqual(before)
+    expect((await history()).length).toBe(rows)
+  })
+
+  it('names no button with a trailing period: the plugin has no buttons, so its labels are checked instead', () => {
+    const labels: string[] = []
+    for (const slug of ['position-grants', 'position-grant-history']) {
+      const col = payload.config.collections.find((c) => c.slug === slug)!
+      const l = col.labels as { singular?: unknown; plural?: unknown }
+      for (const x of [l?.singular, l?.plural]) if (typeof x === 'string') labels.push(x)
+      for (const f of col.fields as unknown as { label?: unknown; options?: ({ label?: unknown } | string)[] }[]) {
+        if (typeof f.label === 'string') labels.push(f.label)
+        for (const o of f.options ?? []) if (typeof o === 'object' && typeof o.label === 'string') labels.push(o.label)
+      }
+    }
+    expect(labels.length).toBeGreaterThan(5)
+    for (const l of labels) expect(l.trimEnd().endsWith('.') && !l.trimEnd().endsWith('...'), l).toBe(false)
+  })
+})
+
+describe('seventh review fixes: a where on a field a collection lacks', () => {
+  it('answers a dotted where on a text field of the history, and an unknown field on grants, with no rows and no 500', async () => {
+    const answer: { v: unknown } = { v: true }
+    const site = await buildConfig({
+      secret: 'test-secret-not-for-production',
+      telemetry: false,
+      typescript: { autoGenerate: false },
+      db: mongooseAdapter({ url: mongo.getUri('sevenwhere'), transactionOptions: false }),
+      collections: [{ slug: 'users', auth: true, fields: [] }],
+      plugins: [
+        positions({
+          positionTypes: [{ value: 'editor' }],
+          scopeKinds: [{ value: 'project' }],
+          refuseGrant: false,
+          allowWithoutTransactions: true,
+          canGrant: () => true,
+          canRead: () => answer.v as never,
+          canReadPrivate: () => answer.v as never,
+        }),
+      ],
+    })
+    try {
+      const p = await getPayload({ config: site, key: 'sevenwhere' })
+      const u = (await p.create({ collection: 'users', data: { email: 'a@example.com', password: PW } as never })) as unknown as U
+      const h = (await p.create({ collection: 'users', data: { email: 'b@example.com', password: PW } as never })) as unknown as U
+      await p.create({ collection: 'position-grants' as never, data: { holder: h.id, position: 'editor', scopeKind: 'project', scopeId: 'a' } as never, user: as(u), overrideAccess: false })
+      const find = (col: string) => p.find({ collection: col as never, user: as(u), overrideAccess: false })
+      for (const w of [{ 'grant.holder': { equals: 'x' } }, { 'by.x': { exists: true } }, { 'event.x': { equals: 'grant' } }, { and: [{ event: { equals: 'grant' } }, { 'grant.holder': { equals: 'x' } }] }]) {
+        answer.v = w
+        expect(((await find('position-grant-history')) as { totalDocs: number }).totalDocs, JSON.stringify(w)).toBe(0)
+      }
+      for (const w of [{ nothing: { equals: 'x' } }, { 'scopeId.x': { equals: 'a' } }, { 'status.x': { equals: 'pending' } }, { or: [{ scopeId: { equals: 'a' } }, { nothing: { equals: 'x' } }] }]) {
+        answer.v = w
+        expect(((await find('position-grants')) as { totalDocs: number }).totalDocs, JSON.stringify(w)).toBe(0)
+      }
+      // a real where, and a dotted one into the holder relationship, still work
+      answer.v = { scopeId: { equals: 'a' } }
+      expect(((await find('position-grants')) as { totalDocs: number }).totalDocs).toBe(1)
+      answer.v = { 'holder.email': { equals: 'b@example.com' } }
+      expect(((await find('position-grants')) as { totalDocs: number }).totalDocs).toBe(1)
+      answer.v = { 'snapshot.scopeId': { equals: 'a' } }
+      expect(((await find('position-grant-history')) as { totalDocs: number }).totalDocs).toBe(1)
+    } finally {
+      await close(site, 'sevenwhere')
+    }
+  })
+
+  it('does not 500 for a signed-in client that filters on a field grants or history lack, over REST', async () => {
+    const token = (await payload.login({ collection: 'users', data: { email: 'staff@example.com', password: PW } })).token!
+    const get = async (path: string) =>
+      (await handleEndpoints({ config: payload.config as never, request: new Request(`https://site.example/api${path}`, { method: 'GET', headers: { Authorization: `JWT ${token}` } }) })).status
+    for (const path of ['/position-grants?where[nothing][equals]=x', '/position-grants?where[scopeId.x][equals]=x', '/position-grant-history?where[grant.holder][equals]=x', '/position-grant-history?where[nothing][equals]=x'])
+      expect(await get(path), path).toBeLessThan(500)
   })
 })

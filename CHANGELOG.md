@@ -9,6 +9,7 @@
 - `RefuseArgs.action` is narrower: it is always `grant`, never `resume` or `extend`. A host that switched on it needs no branch for the others.
 - The veto runs when the holder accepts, not when someone grants, resumes or extends.
 - Server code that passes `status: 'pending'` on create or update now gets a 403 error. On create, any other status passed is replaced with `pending`.
+- Bulk updates of grants (an update by `where`, over REST, the admin's edit-selected action or the Local API) are refused with a 403. Update each grant by its id. Bulk delete was already refused, and the history never allowed either.
 - A `status` that is not one of the five values (`null` and an empty value included) is refused on update, for users and server code.
 
 **Upgrade steps for hosts.**
@@ -21,6 +22,10 @@
 
 Changes in this release:
 
+- **A refused accept no longer leaves a trace in a bulk update.** The write lock taken for each update bumped `updatedAt`, and Payload's bulk update catches a row's error and commits, so a pending grant whose `updatedAt` differed from `createdAt` showed that its holder was vetoed. Bulk updates are now refused before access and before any other hook, so nothing is written. This also covers a failing history write during a bulk update, which used to commit the grant change with no history row.
+- A host `where` from `canRead` on a field grants don't have (or dotted into a text field), and a `canReadPrivate` where dotted into a text field of the history (for example `grant.holder`), returned a 500. Both now return no rows.
+- **Tested (seventh review):** 98 tests against a real Payload with in-memory MongoDB: bulk accept by a minor, an adult, a staff user and server code over the Local API and REST with the grant, `updatedAt`, history and audit unchanged; a failing history write for one update and for a bulk one; dotted and unknown fields in host wheres; no label ends with a period. 6 tests fail on the old code (2 old tests changed to expect the refusal, 4 new).
+- **Not tested (seventh review):** the admin's edit-selected action in a browser, SQL adapters. The plugin has no buttons or custom components; its labels (collection and option names) were checked for a trailing period.
 - **A null or unknown status on update is refused.** With `required` dropped from `status`, `{ status: null }` was accepted: the grant stopped counting with no history row, no audit event and no `beforeRevoke`, could not be revoked afterwards (it counted as final), was skipped by the expiry sweep, and kept its live key so a new grant for the same holder, position and scope failed. Any status that is not `pending`, `active`, `paused`, `revoked` or `expired` is now refused over REST, GraphQL and the Local API, for users and server code, single and bulk.
 - The admin create form no longer shows the `status` field, since the plugin sets every new grant to pending. It shows on edit.
 - A `canReadPrivate` where on a field the history rows lack (for example `scopeId`, which is only in `snapshot.scopeId`) returned a 500 on history reads. It now returns no rows.

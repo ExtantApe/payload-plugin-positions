@@ -33,12 +33,22 @@ const isWhere = (v: unknown): v is Where => {
       : !!value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length > 0 && Object.keys(value).every((op) => OPERATORS.has(op)),
   )
 }
-/** The top-level fields a history row has. A where on any other field would be a query error (a 500), so the history answers it with no rows. */
+/**
+ * True when every field a where names exists on the collection, so a stray field never reaches the database as a query error (a 500).
+ * `nested` lists the fields that may be dotted into (a relationship, or a JSON field); any other field with a dot is refused.
+ */
+const usesOnly = (w: Where, fields: Set<string>, nested: Set<string>): boolean =>
+  Object.entries(w).every(([key, value]) => {
+    if (key === 'and' || key === 'or') return (value as Where[]).every((x) => usesOnly(x, fields, nested))
+    const [head, ...rest] = key.split('.')
+    return fields.has(head!) && (rest.length === 0 || nested.has(head!))
+  })
+/** The fields a history row has. Only `snapshot` and `previous` (JSON) can be dotted into; `grant`, `event` and `by` are text. */
 const HISTORY_FIELDS = new Set(['id', 'createdAt', 'updatedAt', 'grant', 'event', 'by', 'snapshot', 'previous'])
-const usesOnHistory = (w: Where): boolean =>
-  Object.entries(w).every(([key, value]) =>
-    key === 'and' || key === 'or' ? (value as Where[]).every(usesOnHistory) : HISTORY_FIELDS.has(key.split('.')[0]!),
-  )
+const usesOnHistory = (w: Where) => usesOnly(w, HISTORY_FIELDS, new Set(['snapshot', 'previous']))
+/** The fields a grant has that a host where may name. `notes` and the hidden live key are left out. The relationships can be dotted into. */
+const GRANT_FIELDS = new Set(['id', 'createdAt', 'updatedAt', 'holder', 'position', 'scopeKind', 'scopeId', 'startsAt', 'endsAt', 'grantedBy', 'status', 'revokedAt', 'revokedBy'])
+const usesOnGrants = (w: Where) => usesOnly(w, GRANT_FIELDS, new Set(['holder', 'grantedBy', 'revokedBy']))
 const NO_ROWS: Where = { id: { in: [] } }
 const STATUSES = ['pending', 'active', 'paused', 'revoked', 'expired']
 /** A date, or a date and a time that carries its zone (`Z` or an offset). A time with no zone would be read in the server's zone, so it is refused. */
@@ -243,7 +253,7 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
         if (opts.canRead) {
           try {
             const answer = await opts.canRead({ req, user })
-            return answer === true ? true : isWhere(answer) ? answer : false
+            return answer === true ? true : isWhere(answer) ? (usesOnGrants(answer) ? answer : NO_ROWS) : false
           } catch {
             return false
           }
@@ -303,6 +313,14 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
       { name: 'liveKey', type: 'text', unique: true, index: true, hidden: true, admin: { disabled: true } },
     ],
     hooks: {
+      // A bulk update (a `where`, no id) is refused before access and before any other hook. Payload's bulk update catches each row's
+      // error and commits, so a refused accept would keep the write lock's `updatedAt` bump and show which holders were vetoed.
+      beforeOperation: [
+        ({ args, operation }) => {
+          const a = args as { where?: unknown; id?: unknown }
+          if (operation === 'update' && a.id === undefined && a.where !== undefined) throw refuse('Grants are changed one at a time. Update each grant by its id.')
+        },
+      ],
       beforeValidate: [
         ({ data, operation }) => {
           if (operation !== 'create' || !data) return data
