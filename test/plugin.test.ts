@@ -3,7 +3,7 @@ import { configToSchema } from '@payloadcms/graphql'
 import { graphql } from 'graphql'
 import { MongoMemoryReplSet } from 'mongodb-memory-server'
 import { buildConfig, createLocalReq, getPayload, handleEndpoints, type Payload } from 'payload'
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { expireGrants, hasPosition, positions, positionsOf, type AuditEvent } from '../src/index.js'
 
@@ -15,7 +15,7 @@ const PW = 'correct-horse-battery'
 let payload: Payload
 let mongo: MongoMemoryReplSet
 const log: string[] = []
-const answers: { canGrant?: () => unknown; refuse?: () => unknown; beforeGrant?: () => void } = {}
+const answers: { canGrant?: () => unknown; refuse?: (a?: never) => unknown; beforeGrant?: () => void } = {}
 const seen: { grant?: unknown[]; revoke?: unknown[] } = {}
 const DAY = 86_400_000
 const iso = (offset: number) => new Date(Date.now() + offset).toISOString()
@@ -38,6 +38,7 @@ const refused = async (p: Promise<unknown>) => {
     return (e as Error).message
   }
 }
+const history = async () => (await payload.find({ collection: 'position-grant-history' as never, pagination: false, overrideAccess: true })).docs
 const record = (e: AuditEvent) => {
   log.push(`${e.phase}:${e.event}`)
 }
@@ -66,15 +67,22 @@ beforeAll(async () => {
         scopeKinds: [{ value: 'project' }, { value: 'group' }],
         canGrant: (a) => {
           seen.grant?.push(a)
-          return answers.canGrant ? (answers.canGrant() as boolean) : (a.user as U).level === 'staff'
+          return answers.canGrant ? (answers.canGrant() as boolean) : ['staff', 'scoped'].includes((a.user as U).level ?? '')
         },
         canRevoke: (a) => {
           seen.revoke?.push(a)
           return ['staff', 'revoker'].includes((a.user as U).level ?? '')
         },
         allowSelfGrant: false,
-        refuseGrant: ({ holder }) => {
-          if (answers.refuse) return answers.refuse() as string | null
+        canReadPrivate: ({ user, grant }) => {
+          const level = (user as U).level
+          if (level === 'staff') return true
+          if (level === 'scoped') return grant ? grant.scopeId === 'p-1' : { 'snapshot.scopeId': { equals: 'p-1' } }
+          return false
+        },
+        refuseGrant: (args) => {
+          const { holder } = args
+          if (answers.refuse) return answers.refuse(args as never) as string | null
           return (holder as { underage?: boolean }).underage ? 'Not available for this account.' : null
         },
         audit: {
@@ -204,7 +212,7 @@ describe('fail-closed access', () => {
       typescript: { autoGenerate: false },
       db: mongooseAdapter({ url: mongo.getUri('bare'), transactionOptions: false }),
       collections: [{ slug: 'users', auth: true, fields: [] }],
-      plugins: [positions({ positionTypes: [{ value: 'editor' }], scopeKinds: [{ value: 'project' }], refuseGrant: false })],
+      plugins: [positions({ positionTypes: [{ value: 'editor' }], scopeKinds: [{ value: 'project' }], refuseGrant: false, allowWithoutTransactions: true })],
     })
     const p = await getPayload({ config: bare, key: 'bare' })
     const u = (await p.create({ collection: 'users', data: { email: 'x@example.com', password: PW } as never })) as unknown as U
@@ -446,7 +454,7 @@ describe('review fixes', () => {
       typescript: { autoGenerate: false },
       db: mongooseAdapter({ url: mongo.getUri('selfgrant'), transactionOptions: false }),
       collections: [{ slug: 'users', auth: true, fields: [] }],
-      plugins: [positions({ positionTypes: [{ value: 'editor' }], scopeKinds: [{ value: 'project' }], refuseGrant: false, allowSelfGrant: true, canGrant: () => true })],
+      plugins: [positions({ positionTypes: [{ value: 'editor' }], scopeKinds: [{ value: 'project' }], refuseGrant: false, allowSelfGrant: true, allowWithoutTransactions: true, canGrant: () => true })],
     })
     const p = await getPayload({ config: site, key: 'selfgrant' })
     const u = (await p.create({ collection: 'users', data: { email: 'me@example.com', password: PW } as never })) as unknown as U
@@ -587,6 +595,95 @@ describe('review fixes', () => {
       expect(await status(g.id)).toBe('paused')
       expect((await grants()).totalDocs).toBe(1)
     })
+  })
+})
+
+describe('second review fixes', () => {
+  const update = (id: string, data: Record<string, unknown>, user: U | null = staff) =>
+    payload.update({ collection: 'position-grants' as never, id, data: data as never, user: (user ? as(user) : undefined) as never, overrideAccess: false })
+
+  it('shows the veto the grant as it would be after an extension, so it can refuse a long one', async () => {
+    const g = (await grant({ ...base(), endsAt: iso(5 * DAY) })) as never as { id: string }
+    answers.refuse = (a) => {
+      const end = (a as unknown as { grant: { endsAt?: string } }).grant.endsAt
+      return end && Date.parse(end) > Date.now() + 30 * DAY ? 'Too long.' : null
+    }
+    expect(await refused(update(g.id, { endsAt: iso(400 * DAY) }))).toBe('Too long.')
+    expect(await refused(update(g.id, { endsAt: null }))).toBeNull() // no end: the veto reads no endsAt, as written
+    await update(g.id, { endsAt: iso(20 * DAY) })
+  })
+
+  it('lets only the host’s canReadPrivate decide who reads notes and history, narrowed by scope', async () => {
+    const scoped = await make('scoped@example.com', { level: 'scoped' })
+    await grant({ ...base(), notes: 'inside' })
+    await grant({ ...base(), scopeId: 'p-2', notes: 'outside' })
+    const read = (u: U) => payload.find({ collection: 'position-grants' as never, user: as(u), overrideAccess: false, sort: 'scopeId' })
+    const notes = ((await read(scoped)).docs as never as { notes?: string }[]).map((d) => d.notes ?? null)
+    expect(notes).toEqual(['inside', null]) // the granter sees every grant, but notes only for their scope
+    const hist = await payload.find({ collection: 'position-grant-history' as never, user: as(scoped), overrideAccess: false })
+    expect((hist.docs as never as { snapshot: { scopeId: string } }[]).map((h) => h.snapshot.scopeId)).toEqual(['p-1'])
+    expect((await read(staff)).docs.map((d) => (d as never as { notes: string }).notes).sort()).toEqual(['inside', 'outside'])
+  })
+
+  it('reads no notes and no history when the host gave no canReadPrivate, even to those who can grant', async () => {
+    const site = await buildConfig({
+      secret: 'test-secret-not-for-production',
+      telemetry: false,
+      typescript: { autoGenerate: false },
+      db: mongooseAdapter({ url: mongo.getUri('noprivate'), transactionOptions: false }),
+      collections: [{ slug: 'users', auth: true, fields: [] }],
+      plugins: [positions({ positionTypes: [{ value: 'editor' }], scopeKinds: [{ value: 'project' }], refuseGrant: false, allowWithoutTransactions: true, canGrant: () => true })],
+    })
+    const p = await getPayload({ config: site, key: 'noprivate' })
+    const u = (await p.create({ collection: 'users', data: { email: 'a@example.com', password: PW } as never })) as unknown as U
+    const h = (await p.create({ collection: 'users', data: { email: 'b@example.com', password: PW } as never })) as unknown as U
+    await p.create({ collection: 'position-grants' as never, data: { holder: h.id, position: 'editor', scopeKind: 'project', scopeId: 'a', notes: 'secret' } as never, user: as(u), overrideAccess: false })
+    const found = (await p.find({ collection: 'position-grants' as never, user: as(u), overrideAccess: false })).docs[0] as never as Record<string, unknown>
+    expect(found.position).toBe('editor')
+    expect('notes' in found).toBe(false)
+    expect(await refused(p.find({ collection: 'position-grant-history' as never, user: as(u), overrideAccess: false }))).toBeTruthy()
+    await p.db.destroy?.()
+  })
+
+  it('undoes a grant when its history row can’t be written', async () => {
+    const real = payload.create.bind(payload)
+    const spy = vi.spyOn(payload, 'create').mockImplementation(((args: { collection: string }) =>
+      args.collection === 'position-grant-history' ? Promise.reject(new Error('history store down')) : real(args as never)) as never)
+    try {
+      expect(await refused(grant(base()))).toBeTruthy()
+    } finally {
+      spy.mockRestore()
+    }
+    expect((await grants()).totalDocs).toBe(0)
+    const g = (await grant(base())) as never as { id: string }
+    const spy2 = vi.spyOn(payload, 'create').mockImplementation(((args: { collection: string }) =>
+      args.collection === 'position-grant-history' ? Promise.reject(new Error('history store down')) : real(args as never)) as never)
+    try {
+      expect(await refused(update(g.id, { status: 'paused' }))).toBeTruthy()
+    } finally {
+      spy2.mockRestore()
+    }
+    expect(((await payload.findByID({ collection: 'position-grants' as never, id: g.id })) as never as { status: string }).status).toBe('active')
+    expect((await history()).length).toBe(1)
+  })
+
+  it('refuses every change when the database has no transactions, unless the host accepts that', async () => {
+    const build = (name: string, allow: boolean) =>
+      buildConfig({
+        secret: 'test-secret-not-for-production',
+        telemetry: false,
+        typescript: { autoGenerate: false },
+        db: mongooseAdapter({ url: mongo.getUri(name), transactionOptions: false }),
+        collections: [{ slug: 'users', auth: true, fields: [] }],
+        plugins: [positions({ positionTypes: [{ value: 'editor' }], scopeKinds: [{ value: 'project' }], refuseGrant: false, canGrant: () => true, allowWithoutTransactions: allow })],
+      })
+    const p = await getPayload({ config: await build('notx', false), key: 'notx' })
+    const u = (await p.create({ collection: 'users', data: { email: 'a@example.com', password: PW } as never })) as unknown as U
+    const h = (await p.create({ collection: 'users', data: { email: 'b@example.com', password: PW } as never })) as unknown as U
+    const data = { holder: h.id, position: 'editor', scopeKind: 'project', scopeId: 'a' } as never
+    expect(await refused(p.create({ collection: 'position-grants' as never, data, user: as(u), overrideAccess: false }))).toMatch(/can’t be done right now/)
+    expect((await p.find({ collection: 'position-grants' as never, overrideAccess: true })).totalDocs).toBe(0)
+    await p.db.destroy?.()
   })
 })
 

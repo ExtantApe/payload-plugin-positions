@@ -102,6 +102,19 @@ export type PositionsOptions = {
    * also refuses, with a general reason.
    */
   refuseGrant: RefuseFn | false
+  /**
+   * Who may read a grant's notes and the history. Separate from `canGrant`, so a granter limited to one scope doesn't
+   * read everything. Nobody can unless this is given. For notes it is called with the `grant` and must answer exactly
+   * `true`. For the history it is called with no grant, and may answer `true` or a Payload `where` on the history rows
+   * (`snapshot.scopeKind`, `snapshot.scopeId`, `snapshot.holder` and so on) to narrow what is visible.
+   */
+  canReadPrivate?: (args: { req: PayloadRequest; user: AccessArgs['user']; grant?: PositionGrant }) => boolean | Where | Promise<boolean | Where>
+  /**
+   * The plugin writes the history in the same database transaction as the grant, so a history failure undoes the
+   * change. Without transactions it can't promise that, so it refuses every change. Set true only if you accept a
+   * grant that can be saved without its history row. Default false.
+   */
+  allowWithoutTransactions?: boolean
   /** Audit hooks. A `before` hook that throws stops the change. An `after` hook that throws is logged and ignored. */
   audit?: {
     beforeGrant?: AuditHook

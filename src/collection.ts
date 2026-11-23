@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 
-import { APIError, type CollectionConfig, type PayloadRequest } from 'payload'
+import { APIError, type CollectionConfig, type PayloadRequest, type Where } from 'payload'
 
 import { idOf } from './helpers.js'
 import {
@@ -72,6 +72,25 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
   const canGrant = (req: PayloadRequest, extra: Partial<AccessArgs> = {}) => ask(opts.canGrant, req, extra)
   const canRevoke = (req: PayloadRequest, extra: Partial<AccessArgs> = {}) => ask(opts.canRevoke ?? opts.canGrant, req, extra)
   const by = (req: PayloadRequest) => idOf(req.user)
+  /** Notes and history. Nobody without the host's `canReadPrivate`; only `true` or, for history, a `where` counts. */
+  async function readPrivate(req: PayloadRequest, grant?: PositionGrant): Promise<boolean | Where> {
+    const user = signedIn(req)
+    if (!user || !opts.canReadPrivate) return false
+    try {
+      const answer = await opts.canReadPrivate({ req, user, grant })
+      if (answer === true) return true
+      return !grant && answer && typeof answer === 'object' ? answer : false
+    } catch {
+      return false
+    }
+  }
+  /** Writes need a transaction so the history row and the change stand or fall together. */
+  async function needTransaction(req: PayloadRequest) {
+    // The id may still be a promise, and stays one when the adapter has no transactions to give.
+    if (opts.allowWithoutTransactions || (await req.transactionID)) return
+    req.payload.logger.error('positions: refusing a change because the database has transactions off. Turn them on, or set allowWithoutTransactions.')
+    throw refuse('This can’t be done right now.')
+  }
 
   const run = async (name: keyof NonNullable<PositionsOptions['audit']>, event: AuditEvent, mustPass: boolean) => {
     const hook: AuditHook | undefined = opts.audit?.[name]
@@ -197,8 +216,8 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
         name: 'notes',
         type: 'textarea',
         maxLength: 2000,
-        access: { read: ({ req }) => canGrant(req) },
-        admin: { description: 'Only people who can grant can read these. The holder can’t.' },
+        access: { read: async ({ req, doc }) => (await readPrivate(req, normalize((doc ?? {}) as Record<string, unknown>))) === true },
+        admin: { description: 'Only people the host allows can read these (canReadPrivate). The holder can’t.' },
       },
       // Makes a second live grant for the same holder, position and scope fail in the database, not just in a check.
       { name: 'liveKey', type: 'text', unique: true, index: true, hidden: true, admin: { disabled: true } },
@@ -211,6 +230,7 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
       ],
       beforeChange: [
         async ({ data, originalDoc, operation, req }) => {
+          await needTransaction(req)
           const now = Date.now()
           if (operation === 'create') {
             const type = positionTypes.find((t) => t.value === data.position)
@@ -307,7 +327,8 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
               if (!(await canGrant(req, { id: before.id, data: { ...(data as Partial<PositionGrant>), holder: before.holder }, grant: before, change: resume ? 'resume' : 'extend' })))
                 throw refuse('You can’t do that.')
             } else if (req.user) throw refuse('You can’t do that.')
-            await vetoed(req, before, resume ? 'reactivate' : 'extend')
+            // The veto sees the grant as it would be after the change, so it can judge the new end date.
+            await vetoed(req, { ...normalize({ ...originalDoc, ...data }), id: before.id }, resume ? 'reactivate' : 'extend')
           }
           const asker = by(req)
           const merged = normalize(next)
@@ -354,7 +375,7 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
       description: 'Every grant, pause, resume, end-date change, revoke and expiry. Rows are added by the plugin and can’t be changed or deleted.',
     },
     access: {
-      read: ({ req }) => canGrant(req),
+      read: ({ req }) => readPrivate(req),
       create: () => false,
       update: () => false,
       delete: () => false,
