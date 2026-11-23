@@ -295,6 +295,9 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
                 ],
               },
               limit: 20,
+              // No page count: Payload's Mongo adapter sends the find and its count at once, and when this is the first
+              // query in the transaction the two race to start it (NoSuchTransaction). We don't need the total.
+              pagination: false,
               depth: 0,
               overrideAccess: true,
               req,

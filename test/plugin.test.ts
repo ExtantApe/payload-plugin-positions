@@ -777,6 +777,20 @@ describe('follow-ups', () => {
     }
   })
 
+  it('looks for a duplicate grant without a page count, so no count races the find to start the transaction', async () => {
+    // With a count, Payload's Mongo adapter sends find and countDocuments at once as the first queries in the
+    // transaction, and now and then the server sees the second one first (NoSuchTransaction).
+    const spy = vi.spyOn(payload.db, 'find')
+    try {
+      await grant(base())
+      const dup = spy.mock.calls.map((c) => c[0] as { collection: string; pagination?: boolean }).filter((a) => a.collection === 'position-grants')
+      expect(dup.length).toBeGreaterThan(0)
+      for (const a of dup) expect(a.pagination).toBe(false)
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
   it('refuses dates that don’t exist and times with no zone, and accepts zoned times', async () => {
     for (const bad of ['2026-02-30', '2027-02-29', '2026-13-01', '2026-04-31', '2099-01-01T10:00', '2099-01-01 10:00:00', '2099-01-01T24:00:00Z', '2099-01-01T10:60Z', '2099-01-01T10:00:00+25:00']) {
       expect(await refused(grant({ ...base(), endsAt: bad })), bad).toMatch(/dates aren’t valid/)
