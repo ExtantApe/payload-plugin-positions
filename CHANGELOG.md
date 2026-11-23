@@ -19,6 +19,12 @@
 
 Changes in this release:
 
+- **A client can't set a grant to `pending`.** A paused grant could be lifted through `pending`: the change skipped `canGrant` and the self-grant check, then the holder accepted. Active to pending also wrote no history row or audit event. A client-set `pending` is now refused on create and update over REST, GraphQL and the Local API, for users and server code. Only the plugin sets it (new grants, resumes, extensions). Re-sending `pending` on a grant that is already pending is allowed.
+- **A `where` from `canRead` or `canReadPrivate` may use only Payload's operators** (equals, not_equals, in, not_in, all, exists, greater_than, greater_than_equal, less_than, less_than_equal, like, not_like, contains, near, within, intersects) plus `and` and `or`. An unknown operator such as `{ scopeId: { bogus: 'x' } }` used to match every row; it is now no.
+- The `status` field has no default and is not required in the schema; the plugin sets `pending` itself on create.
+- README: extending an active grant puts it back to pending and the holder loses the position until they accept; a granter without `canRevoke` can suspend someone this way, so hosts should tell the holder.
+- **Tested:** 87 tests against a real Payload with in-memory MongoDB, including both repros, active to pending (no history row, no audit event), create, REST, GraphQL and the Local API with a user and server code, and unknown operators for grants and history. The new tests fail without the fix.
+- **Not tested:** a real app or browser, the admin form with the new status field, SQL adapters.
 
 - **Behavior change: a grant is pending until the holder accepts, and the veto runs at accept.** Version 0.1.0 ran the veto when a grant, resume or extension was made. A granter got 403 for a minor and 201 for an adult (403 against 200 on resume and extension), which told them who is a minor. Every grant is now saved as `pending`, the same for everyone, and the veto runs when the holder accepts it. The granter never sees the veto's answer. A resume or an extension puts the grant back to `pending`, so the holder accepts again. New `pending` status, new `accept` audit event and history event (`beforeAccept`, `afterAccept`). Hosts must have holders accept grants (set `status: 'active'` as the holder, or from server code) before they count; helpers ignore pending grants. `action` in `refuseGrant` is now always `grant`. The expiry sweep also covers pending grants.
 - A holder can accept or decline (`revoked`) their own pending grant and change nothing else.

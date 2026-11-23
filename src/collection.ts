@@ -16,9 +16,12 @@ import {
 } from './types.js'
 
 const refuse = (message: string) => new APIError(message, 403, undefined, true)
+const PENDING = 'A grant is set to pending by the plugin only.'
 const GENERAL = 'This position can’t be granted.'
 const LIVE: PositionStatus[] = ['pending', 'active', 'paused']
-/** A where from the host counts only when it is a real one: at least one condition, every field holding an operator, and `and` or `or` holding a non-empty list of wheres. `{}`, `[]` and anything else mean no. */
+/** Payload's own where operators (`validOperators` in payload 3.92). Any other key under a field is not an operator, and the answer is no. */
+const OPERATORS = new Set(['equals', 'not_equals', 'in', 'not_in', 'all', 'exists', 'greater_than', 'greater_than_equal', 'less_than', 'less_than_equal', 'like', 'not_like', 'contains', 'near', 'within', 'intersects'])
+/** A where from the host counts only when it is a real one: at least one condition, every field holding only Payload's operators, and `and` or `or` holding a non-empty list of wheres. `{}`, `[]` and anything else mean no. */
 const isWhere = (v: unknown): v is Where => {
   if (!v || typeof v !== 'object' || Array.isArray(v)) return false
   const entries = Object.entries(v)
@@ -27,7 +30,7 @@ const isWhere = (v: unknown): v is Where => {
   return entries.every(([key, value]) =>
     key === 'and' || key === 'or'
       ? Array.isArray(value) && value.length > 0 && value.every(isWhere)
-      : !!value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length > 0,
+      : !!value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length > 0 && Object.keys(value).every((op) => OPERATORS.has(op)),
   )
 }
 /** A date, or a date and a time that carries its zone (`Z` or an offset). A time with no zone would be read in the server's zone, so it is refused. */
@@ -263,8 +266,7 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
       {
         name: 'status',
         type: 'select',
-        required: true,
-        defaultValue: 'pending',
+        // No default and not required: the plugin sets every new grant to pending itself, and refuses a client that asks for it.
         index: true,
         options: [
           { label: 'Pending acceptance', value: 'pending' },
@@ -289,6 +291,14 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
       { name: 'liveKey', type: 'text', unique: true, index: true, hidden: true, admin: { disabled: true } },
     ],
     hooks: {
+      beforeValidate: [
+        ({ data, operation }) => {
+          if (operation !== 'create' || !data) return data
+          if (data.status === 'pending') throw refuse(PENDING)
+          data.status = 'pending'
+          return data
+        },
+      ],
       beforeDelete: [
         () => {
           throw refuse('Grants are never deleted. Revoke the grant instead.')
@@ -298,6 +308,9 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
         async ({ data, originalDoc, operation, req }) => {
           await needTransaction(req)
           const now = Date.now()
+          // Only the plugin sets a grant to pending (on create, in beforeValidate, and on a resume or an extension). A client can't, over any API:
+          // it would skip the grant check on a resume and let a paused or active grant be lifted by the holder accepting.
+          if (operation === 'update' && data.status === 'pending' && originalDoc?.status !== 'pending') throw refuse(PENDING)
           if (operation === 'create') {
             const type = positionTypes.find((t) => t.value === data.position)
             if (!type) throw refuse('Unknown position.')

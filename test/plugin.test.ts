@@ -1156,7 +1156,7 @@ describe('plugin', () => {
       const find = (col: string) => p.find({ collection: col as never, user: as(u), overrideAccess: false })
       expect((await find('position-grants')).totalDocs).toBe(1) // true still reads
       expect((await find('position-grant-history')).totalDocs).toBe(1)
-      for (const bad of [{}, [], { and: [] }, { or: [{}] }, { scopeId: {} }, { scopeId: 'a' }, { scopeId: null }, 'x', 1, false, null, { and: [{ scopeId: { equals: 'a' } }, []] }]) {
+      for (const bad of [{}, [], { and: [] }, { or: [{}] }, { scopeId: {} }, { scopeId: 'a' }, { scopeId: null }, 'x', 1, false, null, { and: [{ scopeId: { equals: 'a' } }, []] }, { scopeId: { bogus: 'x' } }, { scopeId: { equals: 'a', bogus: 'x' } }, { or: [{ scopeId: { equals: 'a' } }, { scopeId: { bogus: 'x' } }] }, { 'snapshot.scopeId': { $ne: 'zzz' } }]) {
         answer.v = bad
         expect(await refused(find('position-grants')), JSON.stringify(bad)).toBeTruthy()
         expect(await refused(find('position-grant-history')), JSON.stringify(bad)).toBeTruthy()
@@ -1164,6 +1164,8 @@ describe('plugin', () => {
       answer.v = { scopeId: { equals: 'a' } } // a real where still works
       expect((await find('position-grants')).totalDocs).toBe(1)
       answer.v = { or: [{ scopeId: { equals: 'a' } }, { scopeId: { equals: 'b' } }] }
+      expect((await find('position-grants')).totalDocs).toBe(1)
+      answer.v = { scopeId: { in: ['a'], not_equals: 'b' } } // several of Payload's own operators on one field
       expect((await find('position-grants')).totalDocs).toBe(1)
     } finally {
       await close(site, 'emptywhere')
@@ -1241,6 +1243,162 @@ describe('fourth review fixes', () => {
       expect(['active', 'revoked']).toContain(end)
       const events = (await historyEvents()).length
       expect(events).toBeGreaterThan(0)
+    }
+  })
+})
+
+describe('fifth review fixes: only the plugin sets pending', () => {
+  const update = (id: string, data: Record<string, unknown>, user: U | null = staff) =>
+    payload.update({ collection: 'position-grants' as never, id: id as never, data: data as never, user: (user ? as(user) : undefined) as never, overrideAccess: false })
+  const withEmail = async (u: U) => (await payload.findByID({ collection: 'users', id: u.id })) as never as U
+  const api = async (u: U, path: string, method: string, body?: unknown) => {
+    const token = (await payload.login({ collection: 'users', data: { email: (u as never as { email: string }).email ?? '', password: PW } })).token!
+    const res = await handleEndpoints({
+      config: payload.config as never,
+      request: new Request(`https://site.example/api${path}`, {
+        method,
+        headers: { Authorization: `JWT ${token}`, 'content-type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      }),
+    })
+    return { status: res.status, body: (await res.json()) as Record<string, any> }
+  }
+  const gql = async (u: U, source: string) => {
+    const { schema } = configToSchema(payload.config)
+    const req = await createLocalReq({ user: as(u) }, payload)
+    req.user = as(u)
+    return graphql({ schema, source, contextValue: { req } })
+  }
+  const pendingRefusal = /pending by the plugin/
+  /** Server code: no user, access skipped. */
+  const server = (id: string, data: Record<string, unknown>) =>
+    payload.update({ collection: 'position-grants' as never, id: id as never, data: data as never, overrideAccess: true })
+
+  it('refuses pending from a revoke-only user on a paused grant, so the holder can’t accept their way back in (local API)', async () => {
+    const g = (await live(base())) as never as { id: string }
+    await update(g.id, { status: 'paused' })
+    const before = (await history()).length
+    expect(await refused(update(g.id, { status: 'pending' }, revoker))).toMatch(pendingRefusal)
+    expect(await status0(g.id)).toBe('paused')
+    expect(await refused(accept(g.id, alice))).toBeTruthy()
+    expect(await status0(g.id)).toBe('paused')
+    expect(await hasPosition(payload, as(alice), 'editor', { kind: 'project', id: 'p-1' })).toBe(false)
+    expect((await history()).length).toBe(before)
+  })
+
+  it('refuses pending from a paused holder who may not grant to themselves', async () => {
+    const g = (await payload.create({ collection: 'position-grants' as never, data: { ...base(), holder: staff.id } as never, overrideAccess: true })) as never as { id: string }
+    await accept(g.id)
+    await update(g.id, { status: 'paused' }, revoker)
+    expect(await refused(update(g.id, { status: 'pending' }, staff))).toMatch(pendingRefusal)
+    expect(await status0(g.id)).toBe('paused')
+    expect(await refused(accept(g.id, staff))).toBeTruthy()
+    expect(await hasPosition(payload, as(staff), 'editor', { kind: 'project', id: 'p-1' })).toBe(false)
+  })
+
+  it('refuses pending on an active grant, and writes no history row or audit event for it', async () => {
+    const g = (await live(base())) as never as { id: string }
+    const rows = (await history()).length
+    log.length = 0
+    for (const u of [staff, revoker]) expect(await refused(update(g.id, { status: 'pending' }, u)), String(u.level)).toMatch(pendingRefusal)
+    expect(await refused(server(g.id, { status: 'pending' }))).toMatch(pendingRefusal)
+    expect(await refused(update(g.id, { status: 'pending' }, alice))).toBeTruthy()
+    expect(await status0(g.id)).toBe('active')
+    expect((await history()).length).toBe(rows)
+    expect(log).toEqual([])
+    expect(await hasPosition(payload, as(alice), 'editor', { kind: 'project', id: 'p-1' })).toBe(true)
+  })
+
+  it('refuses a client-set pending on create, for a user and for server code, and still makes pending grants itself', async () => {
+    expect(await refused(grant({ ...base(), status: 'pending' }))).toMatch(pendingRefusal)
+    expect(await refused(payload.create({ collection: 'position-grants' as never, data: { ...base(), status: 'pending' } as never, overrideAccess: true }))).toMatch(pendingRefusal)
+    expect((await grants()).totalDocs).toBe(0)
+    expect(((await grant(base())) as never as { status: string }).status).toBe('pending')
+  })
+
+  it('still lets a pending grant be edited with its status left as pending, and still puts a resume or an extension back to pending', async () => {
+    const g = (await grant({ ...base(), endsAt: iso(5 * DAY) })) as never as { id: string }
+    expect(((await update(g.id, { status: 'pending', notes: 'made up' })) as never as { status: string }).status).toBe('pending')
+    await accept(g.id, alice)
+    expect(((await update(g.id, { endsAt: iso(30 * DAY) })) as never as { status: string }).status).toBe('pending')
+    await accept(g.id, alice)
+    await update(g.id, { status: 'paused' })
+    expect(((await update(g.id, { status: 'active' })) as never as { status: string }).status).toBe('pending')
+  })
+
+  it('refuses pending over REST on create and update, and nothing changes', async () => {
+    const g = (await live(base())) as never as { id: string }
+    const asRevoker = await withEmail(revoker)
+    const asStaff = await withEmail(staff)
+    const asAlice = await withEmail(alice)
+    await update(g.id, { status: 'paused' })
+    for (const u of [asRevoker, asStaff, asAlice]) {
+      const r = await api(u, `/position-grants/${g.id}`, 'PATCH', { status: 'pending' })
+      expect(r.status).toBe(403)
+    }
+    expect((await api(asStaff, '/position-grants', 'POST', { ...base(), scopeId: 'p-9', status: 'pending' })).status).toBe(403)
+    expect(await status0(g.id)).toBe('paused')
+    expect((await api(asAlice, `/position-grants/${g.id}`, 'PATCH', { status: 'active' })).status).toBe(403)
+    expect((await grants()).totalDocs).toBe(1)
+    const rows = (await history()).length
+    await update(g.id, { status: 'active' }) // staff resumes: pending, as before
+    await accept(g.id, alice)
+    expect((await history()).length).toBeGreaterThan(rows)
+  })
+
+  it('refuses pending over GraphQL on create and update', async () => {
+    const g = (await live(base())) as never as { id: string }
+    const created = await gql(staff, `mutation { createPositionGrant(data: { holder: "${alice.id}", position: editor, scopeKind: project, scopeId: "p-8", status: pending }) { id } }`)
+    expect(created.data?.createPositionGrant ?? null).toBeNull()
+    expect(created.errors?.length).toBeGreaterThan(0)
+    for (const u of [staff, revoker, alice]) {
+      const r = await gql(u, `mutation { updatePositionGrant(id: "${g.id}", data: { status: pending }) { id status } }`)
+      expect(r.data?.updatePositionGrant ?? null).toBeNull()
+      expect(r.errors?.length).toBeGreaterThan(0)
+    }
+    expect(await status0(g.id)).toBe('active')
+    expect((await grants()).totalDocs).toBe(1)
+  })
+})
+
+describe('fifth review fixes: where answers use Payload’s operators only', () => {
+  it('reads a canRead or canReadPrivate where with an unknown operator as no, for grants and history', async () => {
+    const answer: { v: unknown } = { v: true }
+    const site = await buildConfig({
+      secret: 'test-secret-not-for-production',
+      telemetry: false,
+      typescript: { autoGenerate: false },
+      db: mongooseAdapter({ url: mongo.getUri('bogusop'), transactionOptions: false }),
+      collections: [{ slug: 'users', auth: true, fields: [] }],
+      plugins: [
+        positions({
+          positionTypes: [{ value: 'editor' }],
+          scopeKinds: [{ value: 'project' }],
+          refuseGrant: false,
+          allowWithoutTransactions: true,
+          canGrant: () => true,
+          canRead: () => answer.v as never,
+          canReadPrivate: () => answer.v as never,
+        }),
+      ],
+    })
+    try {
+      const p = await getPayload({ config: site, key: 'bogusop' })
+      const u = (await p.create({ collection: 'users', data: { email: 'a@example.com', password: PW } as never })) as unknown as U
+      const h = (await p.create({ collection: 'users', data: { email: 'b@example.com', password: PW } as never })) as unknown as U
+      for (const scopeId of ['a', 'b'])
+        await p.create({ collection: 'position-grants' as never, data: { holder: h.id, position: 'editor', scopeKind: 'project', scopeId } as never, user: as(u), overrideAccess: false })
+      const find = (col: string) => p.find({ collection: col as never, user: as(u), overrideAccess: false })
+      for (const bad of [{ scopeId: { bogus: 'x' } }, { scopeId: { $ne: 'zzz' } }, { scopeId: { equals: 'a', $where: 'x' } }, { and: [{ scopeId: { equals: 'a' } }, { scopeId: { nope: 1 } }] }]) {
+        answer.v = bad
+        expect(await refused(find('position-grants')), JSON.stringify(bad)).toBeTruthy()
+        answer.v = { 'snapshot.scopeId': (bad as { scopeId: unknown }).scopeId ?? { nope: 1 } }
+        expect(await refused(find('position-grant-history')), JSON.stringify(bad)).toBeTruthy()
+      }
+      answer.v = { scopeId: { equals: 'a' } }
+      expect((await find('position-grants')).totalDocs).toBe(1)
+    } finally {
+      await close(site, 'bogusop')
     }
   })
 })

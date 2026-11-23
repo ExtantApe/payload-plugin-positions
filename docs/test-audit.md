@@ -2,6 +2,13 @@
 
 Kept by this repo's owning session, per `~/Code/CLAUDE.md`, "Test self-audits". Newest first.
 
+## 2026-11-23: fifth review fixes
+
+- Promises checked: only the plugin sets pending; a pause can't be lifted without `canGrant`, the self-grant check and the veto; a host `where` uses Payload's operators only.
+- Added: both repros (revoke-only user, paused self-holder), active to pending (no history row, no audit event), create with pending for a user and server code, REST and GraphQL, a pending grant re-saved as pending, resume and extension still going to pending, and bogus operators for grants and history (87 tests). Checked by reverting the fix: 7 of the new tests fail.
+- Test hygiene: the shared server stops with `doCleanup` and `force` in a `finally`; extra instances close in a `finally`.
+- Skipped: the admin form with no default on `status` (no browser here).
+
 ## 2026-11-23: fourth review fixes
 
 - Promises checked: an extension never undoes a pause; two changes at once give one winner and a clean 403, not a 500; read answers count only as `true`, `false` or a real `where`; the accept hooks run around an accept; the test run leaves no Mongo behind.
