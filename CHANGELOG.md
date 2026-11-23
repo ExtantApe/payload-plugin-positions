@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.1.0 (2026-11-23)
 
-- The repo, with the standard Payload plugin kit and an empty plugin. Nothing to install yet. Public since 2026-11-22.
+- The repo, with the standard Payload plugin kit. Public since 2026-11-22.
 - **Core.** The `position-grants` collection (holder, position, scope kind and id, start and end, granted by, status, revoke stamp, notes), host options for position types and scope kinds, `canGrant`, `canRevoke`, `canRead` and `refuseGrant`, audit hooks before and after grant, revoke and expiry, the `hasPosition` and `positionsOf` helpers, and `expireGrants` for a scheduled sweep. Without a `canGrant` that answers exactly `true`, nobody can grant. A unique `liveKey` makes the one-live-grant rule hold under concurrent requests.
 - **Review fixes.** Resuming a paused grant, or moving an end date later or to none, now needs `canGrant` (given the existing grant and what is asked) and the veto; `canRevoke` is given `id` and `data`. Audit hooks for pause, resume and end-date change. The holder reaches `canGrant` as a plain id. Self-grants, self-resumes and self-extensions are refused unless `allowSelfGrant`. Grants can't be deleted, even with `overrideAccess`. Notes are readable only by people who pass `canGrant`; notes are capped at 2000 characters and scope ids at 200. Helpers only accept a user from the plugin's users collection. `refuseGrant` is required (`false` for none). New append-only `position-grant-history`.
 
