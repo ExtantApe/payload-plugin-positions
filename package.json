@@ -1,6 +1,6 @@
 {
   "name": "@extantape/payload-plugin-positions",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Positions for Payload: scoped, dated grants people hold on a site, an organization or a project, with host-defined types, grant rules and an audit trail.",
   "keywords": [
     "payload",
