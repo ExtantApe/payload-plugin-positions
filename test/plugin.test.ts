@@ -1634,3 +1634,176 @@ describe('seventh review fixes: a where on a field a collection lacks', () => {
       expect(await get(path), path).toBeLessThan(500)
   })
 })
+
+describe('eighth review fixes: the lock is taken only after every refusal', () => {
+  const stamp = async (id: string | number) => {
+    const d = (await payload.findByID({ collection: 'position-grants' as never, id: id as never })) as never as Record<string, unknown>
+    return JSON.stringify(d)
+  }
+  const edit = (id: string | number, notes: string) =>
+    payload.update({ collection: 'position-grants' as never, id: id as never, data: { notes } as never, user: as(staff), overrideAccess: false })
+
+  it('does not make a granter edit fail while a vetoed minor accept is in flight (no minors oracle)', async () => {
+    const minor = (await grant({ ...base(), holder: kid.id })) as never as { id: string }
+    let release!: () => void
+    const gate = new Promise<void>((r) => (release = r))
+    let inVeto!: () => void
+    const reached = new Promise<void>((r) => (inVeto = r))
+    answers.refuse = (() => {
+      inVeto()
+      return gate.then(() => 'Not available for this account.')
+    }) as never
+    const accepting = refused(accept(minor.id, kid))
+    await reached
+    // The accept is paused inside the veto. The granter edits now.
+    const edited = await refused(edit(minor.id, 'a note'))
+    release()
+    expect(await accepting).toBeTruthy()
+    expect(edited).toBeNull()
+  })
+
+  it('never writes the row for a refused accept, so the lock cannot be seen', async () => {
+    const minor = (await grant({ ...base(), holder: kid.id })) as never as { id: string }
+    const adult = (await grant({ ...base(), holder: alice.id, scopeId: 'p-2' })) as never as { id: string }
+    const writes: unknown[] = []
+    const real = payload.db.updateOne.bind(payload.db)
+    const spy = vi.spyOn(payload.db, 'updateOne').mockImplementation(((a: { collection: string; data: Record<string, unknown> }) => {
+      if (a.collection === 'position-grants') writes.push(a.data)
+      return real(a as never)
+    }) as never)
+    try {
+      expect(await refused(accept(minor.id, kid))).toBeTruthy()
+      expect(await refused(payload.update({ collection: 'position-grants' as never, id: minor.id as never, data: { holder: staff.id } as never, user: as(staff), overrideAccess: false }))).toBeTruthy()
+      expect(await refused(payload.update({ collection: 'position-grants' as never, id: minor.id as never, data: { status: 'bogus' } as never, user: as(staff), overrideAccess: false }))).toBeTruthy()
+      expect(writes).toEqual([])
+      // a legitimate change still takes the lock and writes
+      expect(((await accept(adult.id, alice)) as never as { status: string }).status).toBe('active')
+      expect(writes.length).toBeGreaterThan(0)
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('keeps the race protection for legitimate writes: four accepts at once give one winner and clean refusals', async () => {
+    const adult = (await grant({ ...base(), holder: alice.id })) as never as { id: string }
+    const results = await Promise.all([0, 1, 2, 3].map(() => refused(accept(adult.id, alice))))
+    expect(results.filter((r) => r === null).length).toBeGreaterThanOrEqual(1)
+    for (const r of results) if (r !== null) expect(r).toMatch(/just changed|final|already|can’t|forbidden|not allowed/i)
+    expect(await status0(adult.id)).toBe('active')
+  })
+
+  describe('with transactions off', () => {
+    it('maps the duplicate-key error of two identical simultaneous grants to the same clean refusal', async () => {
+      const site = await buildConfig({
+        secret: 'test-secret-not-for-production',
+        telemetry: false,
+        typescript: { autoGenerate: false },
+        db: mongooseAdapter({ url: mongo.getUri('eightdup'), transactionOptions: false }),
+        collections: [{ slug: 'users', auth: true, fields: [] }],
+        plugins: [positions({ positionTypes: [{ value: 'editor' }], scopeKinds: [{ value: 'project' }], refuseGrant: false, allowWithoutTransactions: true, canGrant: () => true })],
+      })
+      try {
+        const p = await getPayload({ config: site, key: 'eightdup' })
+        await settle(p)
+        const g = (await p.create({ collection: 'users', data: { email: 'g@example.com', password: PW } as never })) as unknown as U
+        const h = (await p.create({ collection: 'users', data: { email: 'h@example.com', password: PW } as never })) as unknown as U
+        for (let round = 0; round < 3; round++) {
+          const one = () =>
+            p
+              .create({ collection: 'position-grants' as never, data: { holder: h.id, position: 'editor', scopeKind: 'project', scopeId: `r${round}` } as never, user: as(g), overrideAccess: false })
+              .then(() => 'ok', (e: Error & { status?: number }) => `${e.status}:${e.message}`)
+          const out = await Promise.all([one(), one()])
+          expect(out.filter((o) => o === 'ok'), JSON.stringify(out)).toHaveLength(1)
+          expect(out.find((o) => o !== 'ok')).toBe('403:That account already holds this position here.')
+        }
+      } finally {
+        await close(site, 'eightdup')
+      }
+    })
+
+    it('leaves the whole row byte-identical after a refused accept, field check or bad status', async () => {
+      const site = await buildConfig({
+        secret: 'test-secret-not-for-production',
+        telemetry: false,
+        typescript: { autoGenerate: false },
+        db: mongooseAdapter({ url: mongo.getUri('eightnotx'), transactionOptions: false }),
+        collections: [{ slug: 'users', auth: true, fields: [{ name: 'underage', type: 'checkbox' }] }],
+        plugins: [
+          positions({
+            positionTypes: [{ value: 'editor' }],
+            scopeKinds: [{ value: 'project' }],
+            allowWithoutTransactions: true,
+            canGrant: () => true,
+            refuseGrant: ({ holder }) => ((holder as { underage?: boolean }).underage ? 'No.' : null),
+          }),
+        ],
+      })
+      try {
+        const p = await getPayload({ config: site, key: 'eightnotx' })
+        await settle(p)
+        const g = (await p.create({ collection: 'users', data: { email: 'g@example.com', password: PW } as never })) as unknown as U
+        const m = (await p.create({ collection: 'users', data: { email: 'm@example.com', password: PW, underage: true } as never })) as unknown as U
+        const row = (await p.create({ collection: 'position-grants' as never, data: { holder: m.id, position: 'editor', scopeKind: 'project', scopeId: 'a' } as never, user: as(g), overrideAccess: false })) as never as { id: string }
+        const read = async () => JSON.stringify(await p.findByID({ collection: 'position-grants' as never, id: row.id as never }))
+        const before = await read()
+        await new Promise((r) => setTimeout(r, 15))
+        const upd = (data: Record<string, unknown>, user?: U) =>
+          refused(p.update({ collection: 'position-grants' as never, id: row.id as never, data: data as never, user: (user ? as(user) : undefined) as never, overrideAccess: !user }))
+        const tries = [
+          upd({ status: 'active' }, m),
+          upd({ status: 'active' }),
+          upd({ status: 'bogus' }, g),
+          upd({ scopeId: 'b' }, g),
+        ]
+        for (const t of tries) expect(await t).toBeTruthy()
+        expect(await read()).toBe(before)
+      } finally {
+        await close(site, 'eightnotx')
+      }
+    })
+  })
+})
+
+describe('eighth review fixes: where on a relationship, and two identical grants at once', () => {
+  it('answers a host where that dots into a field the accounts collection lacks with no rows, not a 500', async () => {
+    const answer: { v: unknown } = { v: true }
+    const site = await buildConfig({
+      secret: 'test-secret-not-for-production',
+      telemetry: false,
+      typescript: { autoGenerate: false },
+      db: mongooseAdapter({ url: mongo.getUri('eightwhere'), transactionOptions: false }),
+      collections: [{ slug: 'users', auth: true, fields: [] }],
+      plugins: [positions({ positionTypes: [{ value: 'editor' }], scopeKinds: [{ value: 'project' }], refuseGrant: false, allowWithoutTransactions: true, canGrant: () => true, canRead: () => answer.v as never })],
+    })
+    try {
+      const p = await getPayload({ config: site, key: 'eightwhere' })
+      const u = (await p.create({ collection: 'users', data: { email: 'a@example.com', password: PW } as never })) as unknown as U
+      const h = (await p.create({ collection: 'users', data: { email: 'b@example.com', password: PW } as never })) as unknown as U
+      await p.create({ collection: 'position-grants' as never, data: { holder: h.id, position: 'editor', scopeKind: 'project', scopeId: 'a' } as never, user: as(u), overrideAccess: false })
+      const total = async () => ((await p.find({ collection: 'position-grants' as never, user: as(u), overrideAccess: false })) as { totalDocs: number }).totalDocs
+      for (const w of [{ 'holder.bogus': { equals: 'x' } }, { 'grantedBy.nothing.deeper': { exists: true } }, { or: [{ scopeId: { equals: 'a' } }, { 'revokedBy.bogus': { equals: 'x' } }] }]) {
+        answer.v = w
+        expect(await total(), JSON.stringify(w)).toBe(0)
+      }
+      answer.v = { 'holder.email': { equals: 'b@example.com' } }
+      expect(await total()).toBe(1)
+      answer.v = { 'holder.id': { equals: h.id } }
+      expect(await total()).toBe(1)
+    } finally {
+      await close(site, 'eightwhere')
+    }
+  })
+
+  it('gives one 201 and one clean refusal when two identical grants arrive at once', async () => {
+    const body = { ...base() }
+    for (let round = 0; round < 3; round++) {
+      body.scopeId = `race-${round}`
+      const out = await Promise.all([0, 1].map(() => grant({ ...body }).then(() => 'ok', (e: Error & { status?: number }) => `${e.status ?? '?'}:${e.message}`)))
+      expect(out.filter((o) => o === 'ok'), JSON.stringify(out)).toHaveLength(1)
+      const other = out.find((o) => o !== 'ok')!
+      expect(other).toMatch(/^403:/)
+      expect(other).toMatch(/already holds this position here/i)
+    }
+    expect((await grants()).docs.filter((d) => String((d as never as { scopeId: string }).scopeId).startsWith('race-'))).toHaveLength(3)
+  })
+})

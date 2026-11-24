@@ -2,7 +2,7 @@
 
 Positions for Payload: scoped, dated grants people hold on a site, an organization or a project, with host-defined types, grant rules and an audit trail.
 
-**Status:** early, 0.x, not on npm yet. The 98 tests run against a real Payload with an in-memory MongoDB. It hasn't been tried in a real app, and the admin screens haven't been looked at in a browser.
+**Status:** early, 0.x, not on npm yet. The 105 tests run against a real Payload with an in-memory MongoDB. It hasn't been tried in a real app, and the admin screens haven't been looked at in a browser.
 
 ## Agreed scope
 

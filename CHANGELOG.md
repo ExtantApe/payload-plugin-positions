@@ -22,6 +22,13 @@
 
 Changes in this release:
 
+- **The write lock is taken last, so a refused change leaves nothing behind.** It used to be taken before the field checks, `canRevoke` and the veto, so a refused accept by a vetoed minor could make a granter's edit fail with "just changed", and with `allowWithoutTransactions` it bumped `updatedAt`. Both told the granter who was vetoed. The lock now comes after every refusal, the veto and the before hooks. Writes that go ahead are protected as before.
+- **A host `where` that dots into a relationship (`holder.bogus`) returns no rows** when the accounts collection has no such field, instead of a 500. `holder.email`-style filters on real fields still work.
+- **Two identical grants at once give one grant and one clean refusal.** The loser used to get a bare database error from the unique key; it now gets the same 403, "That account already holds this position here.", as the ordinary check.
+
+Tested: the full suite (105 tests, twice) against a real Payload with an in-memory MongoDB, including a veto held open while a granter edits, a spy showing refused updates never write the row, a byte-identical row with transactions off, and identical grants at once with and without transactions. Six of the new tests fail on the previous commit.
+Not tested: SQL adapters, the admin in a browser, a real multi-process deployment.
+
 - **A refused accept no longer leaves a trace in a bulk update.** The write lock taken for each update bumped `updatedAt`, and Payload's bulk update catches a row's error and commits, so a pending grant whose `updatedAt` differed from `createdAt` showed that its holder was vetoed. Bulk updates are now refused before access and before any other hook, so nothing is written. This also covers a failing history write during a bulk update, which used to commit the grant change with no history row.
 - A host `where` from `canRead` on a field grants don't have (or dotted into a text field), and a `canReadPrivate` where dotted into a text field of the history (for example `grant.holder`), returned a 500. Both now return no rows.
 - **Tested (seventh review):** 98 tests against a real Payload with in-memory MongoDB: bulk accept by a minor, an adult, a staff user and server code over the Local API and REST with the grant, `updatedAt`, history and audit unchanged; a failing history write for one update and for a bulk one; dotted and unknown fields in host wheres; no label ends with a period. 6 tests fail on the old code (2 old tests changed to expect the refusal, 4 new).

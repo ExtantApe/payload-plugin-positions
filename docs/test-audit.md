@@ -2,6 +2,12 @@
 
 Kept by this repo's owning session, per `~/Code/CLAUDE.md`, "Test self-audits". Newest first.
 
+## 2026-11-23: eighth review fixes
+
+- Promises checked: a refused update leaves the row byte-identical and never takes the lock, so a granter can't learn who was vetoed from a "just changed" refusal or from `updatedAt`; a host where on a missing related field gives no rows; two identical grants at once give one grant and the "already holds" refusal.
+- Added: a veto held open while a granter edits (ordering is deterministic, no loop), a spy showing refused updates never write the row, a byte-identical row after four kinds of refusal with transactions off, `holder.bogus` and similar wheres (and `holder.email`, `holder.id` still work), identical simultaneous grants with transactions (write conflict) and without (duplicate key), a four-way concurrent accept still giving a winner (105 tests). Checked by reverting the fix: 6 of the new tests fail.
+- Skipped: SQL adapters, a real multi-process run.
+
 ## 2026-11-23: seventh review fixes
 
 - Promises checked: a refused accept leaves nothing behind, in any update path; a failing history write can't commit a grant change; a host where on a field a collection lacks gives no rows, not a 500; interface labels end with no period.

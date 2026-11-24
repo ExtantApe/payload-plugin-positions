@@ -16,6 +16,7 @@ import {
 } from './types.js'
 
 const refuse = (message: string) => new APIError(message, 403, undefined, true)
+const HOLDS = 'That account already holds this position here.'
 const PENDING = 'A grant is set to pending by the plugin only.'
 const GENERAL = 'This position can’t be granted.'
 const LIVE: PositionStatus[] = ['pending', 'active', 'paused']
@@ -37,18 +38,23 @@ const isWhere = (v: unknown): v is Where => {
  * True when every field a where names exists on the collection, so a stray field never reaches the database as a query error (a 500).
  * `nested` lists the fields that may be dotted into (a relationship, or a JSON field); any other field with a dot is refused.
  */
-const usesOnly = (w: Where, fields: Set<string>, nested: Set<string>): boolean =>
+const usesOnly = (w: Where, fields: Set<string>, nested: Set<string>, related?: Set<string>): boolean =>
   Object.entries(w).every(([key, value]) => {
-    if (key === 'and' || key === 'or') return (value as Where[]).every((x) => usesOnly(x, fields, nested))
+    if (key === 'and' || key === 'or') return (value as Where[]).every((x) => usesOnly(x, fields, nested, related))
     const [head, ...rest] = key.split('.')
-    return fields.has(head!) && (rest.length === 0 || nested.has(head!))
+    if (!fields.has(head!)) return false
+    if (rest.length === 0) return true
+    if (!nested.has(head!)) return false
+    // A dotted relationship (`holder.email`) must name a field the related collection has; any other would be a query error.
+    return !related || related.has(rest[0]!)
   })
 /** The fields a history row has. Only `snapshot` and `previous` (JSON) can be dotted into; `grant`, `event` and `by` are text. */
 const HISTORY_FIELDS = new Set(['id', 'createdAt', 'updatedAt', 'grant', 'event', 'by', 'snapshot', 'previous'])
 const usesOnHistory = (w: Where) => usesOnly(w, HISTORY_FIELDS, new Set(['snapshot', 'previous']))
 /** The fields a grant has that a host where may name. `notes` and the hidden live key are left out. The relationships can be dotted into. */
 const GRANT_FIELDS = new Set(['id', 'createdAt', 'updatedAt', 'holder', 'position', 'scopeKind', 'scopeId', 'startsAt', 'endsAt', 'grantedBy', 'status', 'revokedAt', 'revokedBy'])
-const usesOnGrants = (w: Where) => usesOnly(w, GRANT_FIELDS, new Set(['holder', 'grantedBy', 'revokedBy']))
+const RELATED = new Set(['holder', 'grantedBy', 'revokedBy'])
+const usesOnGrants = (w: Where, userFields: Set<string>) => usesOnly(w, GRANT_FIELDS, RELATED, userFields)
 const NO_ROWS: Where = { id: { in: [] } }
 const STATUSES = ['pending', 'active', 'paused', 'revoked', 'expired']
 /** A date, or a date and a time that carries its zone (`Z` or an offset). A time with no zone would be read in the server's zone, so it is refused. */
@@ -158,6 +164,17 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
       throw e
     }
   }
+  /** The fields the accounts collection has, for a host where that dots into a relationship to it. Unknown means only `id`. */
+  const userFieldsOf = (req: PayloadRequest): Set<string> => {
+    const names = new Set(['id', 'createdAt', 'updatedAt'])
+    try {
+      const cfg = (req.payload.collections as unknown as Record<string, { config?: { fields?: { name?: string }[] } }>)[users as unknown as string]?.config
+      for (const f of cfg?.fields ?? []) if (f.name) names.add(f.name)
+    } catch {
+      /* fall back to the three above */
+    }
+    return names
+  }
   /** Writes need a transaction so the history row and the change stand or fall together. */
   async function needTransaction(req: PayloadRequest) {
     // The id may still be a promise, and stays one when the adapter has no transactions to give.
@@ -253,7 +270,7 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
         if (opts.canRead) {
           try {
             const answer = await opts.canRead({ req, user })
-            return answer === true ? true : isWhere(answer) ? (usesOnGrants(answer) ? answer : NO_ROWS) : false
+            return answer === true ? true : isWhere(answer) ? (usesOnGrants(answer, userFieldsOf(req)) ? answer : NO_ROWS) : false
           } catch {
             return false
           }
@@ -393,7 +410,7 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
             for (const d of dup.docs as unknown as PositionGrant[]) {
               if (d.endsAt && Date.parse(d.endsAt) <= now)
                 await req.payload.update({ collection: GRANTS as never, id: d.id as never, data: { status: 'expired' } as never, overrideAccess: true, req })
-              else throw refuse('That account already holds this position here.')
+              else throw refuse(HOLDS)
             }
             // The database's unique index on this key is what stops two requests at once.
             data.liveKey = JSON.stringify([holder, data.position, data.scopeKind ?? null, data.scopeId ?? null])
@@ -402,9 +419,6 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
           }
 
           // An update. Who, what and where never change; a grant that is wrong is revoked and made again.
-          // Take the row's write lock first, so a second change at the same moment is refused here, plainly, and not
-          // as a database error halfway through the save.
-          await claim(req, originalDoc.id)
           const before = normalize(originalDoc)
           for (const f of ['holder', 'position', 'scopeKind', 'scopeId', 'grantedBy', 'startsAt'] as const) {
             if (!(f in data)) continue
@@ -481,6 +495,10 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
           }
           for (const event of eventsOf(before, next))
             await run(hookName('before', event), { event, phase: 'before', grant: merged, previous: before, by: actor(req), req }, true)
+          // Take the row's write lock last, after every refusal and the veto. The lock writes the row (and bumps
+          // `updatedAt`), and a second change at the same moment gets a clean refusal here. Claiming earlier would let a
+          // refused accept of a vetoed holder make a granter's edit fail, or bump `updatedAt`, which would tell the granter.
+          await claim(req, originalDoc.id)
           return data
         },
       ],
@@ -544,4 +562,31 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
   }
 
   return [grants, history]
+}
+
+/**
+ * Two identical grants at once both pass the check for a live one, and the database's unique key on `liveKey` stops the
+ * second. That arrives as a duplicate-key error, or, inside a transaction, as a write conflict on the same key. Either
+ * one becomes the same refusal as the check gives. Only creates of grants are touched.
+ */
+export function mapDuplicateGrant(payload: { db: { create: (args: never) => Promise<unknown> } }): void {
+  const db = payload.db as { create: (args: { collection?: string }) => Promise<unknown>; __positionsGuard?: boolean }
+  if (db.__positionsGuard) return
+  db.__positionsGuard = true
+  const create = db.create.bind(db)
+  db.create = async (args) => {
+    try {
+      return await create(args)
+    } catch (e) {
+      if (args?.collection === GRANTS) {
+        const x = e as { code?: unknown; codeName?: string; errorLabels?: string[]; message?: string; keyPattern?: Record<string, unknown> }
+        const dup = x?.code === 11000 || x?.code === 11001 || /E11000|duplicate key|unique constraint/i.test(String(x?.message ?? ''))
+        const clash = x?.code === 112 || x?.codeName === 'WriteConflict' || !!x?.errorLabels?.includes('TransientTransactionError')
+        // The Mongo adapter turns a duplicate key into a validation error naming the field.
+        const named = (e as { data?: { errors?: { path?: string }[] } })?.data?.errors?.some((f) => f?.path === 'liveKey') || /invalid: liveKey/.test(String(x?.message ?? ''))
+        if (dup || clash || named) throw refuse(HOLDS)
+      }
+      throw e
+    }
+  }
 }
