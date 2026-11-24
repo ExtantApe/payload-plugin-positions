@@ -1,5 +1,62 @@
 # Changelog
 
+## Unreleased (for 0.2.0)
+
+**Breaking.** Hosts have to change something to upgrade from 0.1.0:
+
+- A grant is saved as `pending` and gives nothing until the holder accepts it. Anything that made a grant and expected `hasPosition` to be true now needs an accept step.
+- `PositionStatus` gains `pending`, and `AuditName` gains `accept` (new hooks `beforeAccept` and `afterAccept`, and an `accept` history event).
+- `RefuseArgs.action` is narrower: it is always `grant`, never `resume` or `extend`. A host that switched on it needs no branch for the others.
+- The veto runs when the holder accepts, not when someone grants, resumes or extends.
+- Server code that passes `status: 'pending'` on create or update now gets a 403 error. On create, any other status passed is replaced with `pending`.
+- Bulk updates of grants (an update by `where`, over REST, the admin's edit-selected action or the Local API) are refused with a 403. Update each grant by its id. Bulk delete was already refused, and the history never allowed either.
+- A `status` that is not one of the five values (`null` and an empty value included) is refused on update, for users and server code.
+
+**Upgrade steps for hosts.**
+
+1. Add an accept step: the holder sets their pending grant to `active` (or `revoked` to decline), or server code does it with no user. Nothing else makes a grant count.
+2. Drop code that handled a 403 from the veto on create, resume or extend, and any `action` branch for `resume` or `extend`. The veto's answer now comes back only to the holder at accept, and to server code as the host's reason.
+3. Do not pass the veto's reason on to the granter, and do not accept on the holder's behalf. Either one tells the granter who was refused.
+4. Add `beforeAccept` and `afterAccept` audit hooks if you log the others.
+5. Return only `true`, `false` or a real `where` (at least one condition) from `canRead` and `canReadPrivate`. `{}`, `[]` and any other shape are now refused.
+
+Changes in this release:
+
+- **The write lock is taken last, so a refused change leaves nothing behind.** It used to be taken before the field checks, `canRevoke` and the veto, so a refused accept by a vetoed minor could make a granter's edit fail with "just changed", and with `allowWithoutTransactions` it bumped `updatedAt`. Both told the granter who was vetoed. The lock now comes after every refusal, the veto and the before hooks. Writes that go ahead are protected as before.
+- **A host `where` that dots into a relationship (`holder.bogus`) returns no rows** when the accounts collection has no such field, instead of a 500. `holder.email`-style filters on real fields still work.
+- **Two identical grants at once give one grant and one clean refusal.** The loser used to get a bare database error from the unique key; it now gets the same 403, "That account already holds this position here.", as the ordinary check.
+
+Tested: the full suite (105 tests, twice) against a real Payload with an in-memory MongoDB, including a veto held open while a granter edits, a spy showing refused updates never write the row, a byte-identical row with transactions off, and identical grants at once with and without transactions. Six of the new tests fail on the previous commit.
+Not tested: SQL adapters, the admin in a browser, a real multi-process deployment.
+
+- **A refused accept no longer leaves a trace in a bulk update.** The write lock taken for each update bumped `updatedAt`, and Payload's bulk update catches a row's error and commits, so a pending grant whose `updatedAt` differed from `createdAt` showed that its holder was vetoed. Bulk updates are now refused before access and before any other hook, so nothing is written. This also covers a failing history write during a bulk update, which used to commit the grant change with no history row.
+- A host `where` from `canRead` on a field grants don't have (or dotted into a text field), and a `canReadPrivate` where dotted into a text field of the history (for example `grant.holder`), returned a 500. Both now return no rows.
+- **Tested (seventh review):** 98 tests against a real Payload with in-memory MongoDB: bulk accept by a minor, an adult, a staff user and server code over the Local API and REST with the grant, `updatedAt`, history and audit unchanged; a failing history write for one update and for a bulk one; dotted and unknown fields in host wheres; no label ends with a period. 6 tests fail on the old code (2 old tests changed to expect the refusal, 4 new).
+- **Not tested (seventh review):** the admin's edit-selected action in a browser, SQL adapters. The plugin has no buttons or custom components; its labels (collection and option names) were checked for a trailing period.
+- **A null or unknown status on update is refused.** With `required` dropped from `status`, `{ status: null }` was accepted: the grant stopped counting with no history row, no audit event and no `beforeRevoke`, could not be revoked afterwards (it counted as final), was skipped by the expiry sweep, and kept its live key so a new grant for the same holder, position and scope failed. Any status that is not `pending`, `active`, `paused`, `revoked` or `expired` is now refused over REST, GraphQL and the Local API, for users and server code, single and bulk.
+- The admin create form no longer shows the `status` field, since the plugin sets every new grant to pending. It shows on edit.
+- A `canReadPrivate` where on a field the history rows lack (for example `scopeId`, which is only in `snapshot.scopeId`) returned a 500 on history reads. It now returns no rows.
+- **Tested (sixth review):** 91 tests against a real Payload with in-memory MongoDB: null, empty, unknown and non-string status over the Local API (users and server code), REST single and bulk, GraphQL, and a bulk Local API update, each checking the grant, history and audit are unchanged; the create form condition; a history where on a missing field. 4 of the new tests fail without the fix.
+- **Not tested (sixth review):** the admin create form in a browser, SQL adapters.
+- **A client can't set a grant to `pending`.** A paused grant could be lifted through `pending`: the change skipped `canGrant` and the self-grant check, then the holder accepted. Active to pending also wrote no history row or audit event. A client-set `pending` is now refused on create and update over REST, GraphQL and the Local API, for users and server code. Only the plugin sets it (new grants, resumes, extensions). Re-sending `pending` on a grant that is already pending is allowed.
+- **A `where` from `canRead` or `canReadPrivate` may use only Payload's operators** (equals, not_equals, in, not_in, all, exists, greater_than, greater_than_equal, less_than, less_than_equal, like, not_like, contains, near, within, intersects) plus `and` and `or`. An unknown operator such as `{ scopeId: { bogus: 'x' } }` used to match every row; it is now no.
+- The `status` field has no default and is not required in the schema; the plugin sets `pending` itself on create.
+- README: extending an active grant puts it back to pending and the holder loses the position until they accept; a granter without `canRevoke` can suspend someone this way, so hosts should tell the holder.
+- **Tested:** 87 tests against a real Payload with in-memory MongoDB, including both repros, active to pending (no history row, no audit event), create, REST, GraphQL and the Local API with a user and server code, and unknown operators for grants and history. The new tests fail without the fix.
+- **Not tested:** a real app or browser, the admin form with the new status field, SQL adapters.
+
+- **Behavior change: a grant is pending until the holder accepts, and the veto runs at accept.** Version 0.1.0 ran the veto when a grant, resume or extension was made. A granter got 403 for a minor and 201 for an adult (403 against 200 on resume and extension), which told them who is a minor. Every grant is now saved as `pending`, the same for everyone, and the veto runs when the holder accepts it. The granter never sees the veto's answer. A resume or an extension puts the grant back to `pending`, so the holder accepts again. New `pending` status, new `accept` audit event and history event (`beforeAccept`, `afterAccept`). Hosts must have holders accept grants (set `status: 'active'` as the holder, or from server code) before they count; helpers ignore pending grants. `action` in `refuseGrant` is now always `grant`. The expiry sweep also covers pending grants.
+- A holder can accept or decline (`revoked`) their own pending grant and change nothing else.
+- **`refuseGrant` must be a function or exactly `false`.** `null`, `0`, `''` and other values no longer turn the veto off; they are refused at setup.
+- **A `canRead` or `canReadPrivate` answer of `{}` or `[]` means no**, as in the membership and sharing plugins. Before, `{}` matched every row.
+- A revoke-only user who tries to resume or extend now gets the standard Forbidden answer, not a custom message.
+- Corrected the README, which wrongly said the granter couldn't learn a minor from the veto, and fixed its test count.
+- **Review fixes.** Extending a paused grant (a later end date, or none) now leaves it paused; before, it went to `pending`, and the holder accepting it undid the pause. Two changes to the same grant at once (two accepts, or an accept against a revoke) used to end in a database write conflict and a 500; the loser now gets a plain 403 ("This grant was just changed. Check it and try again."). `canRead` and `canReadPrivate` count a `where` only when it is a real one: every field holds at least one operator and `and` or `or` holds a non-empty list of wheres; `{ field: {} }`, `{ and: [] }`, a bare value and anything else is no. The README warns hosts about relaying the veto's reason and accepting for the holder, and its fails-closed list gives the self-grant message. The test run stops its in-memory MongoDB and deletes its data folder even when closing Payload throws.
+
+Tested: 79 tests. They cover identical status, body, headers and audit events for a grant to a minor and to an adult on create, resume and extension (local API and REST); the veto refusing at accept and the holder's answer not reaching the granter; who may accept or decline; each bad `refuseGrant` value refused at setup; `{}` and `[]` read answers as no; and Forbidden for the revoke-only user.
+A paused grant that is extended stays paused, and only resume plus an accept brings it back; `beforeAccept` and `afterAccept` run once around an accept, not for a refused accept, and a failing `beforeAccept` stops it; four simultaneous accepts, and an accept against a revoke, five rounds each, give one winner and 403 for the rest (the test fails without the lock); `{ and: [] }`, `{ or: [{}] }`, `{ field: {} }`, bare values and non-objects are refused as read answers, and a real `or` of conditions is allowed. A mutation check (the lock removed) fails both concurrency tests.
+Not tested: timing differences between a vetoed and an unvetoed accept; a write conflict on a SQL adapter (the lock is a plain write; only Mongo ran); a real app or browser.
+
 ## 0.1.0 (2026-11-23)
 
 - The repo, with the standard Payload plugin kit. Public since 2026-11-22.

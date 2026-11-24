@@ -3,7 +3,7 @@ import type { Payload, PayloadRequest, Where } from 'payload'
 export const GRANTS = 'position-grants'
 export const HISTORY = 'position-grant-history'
 
-export type PositionStatus = 'active' | 'paused' | 'revoked' | 'expired'
+export type PositionStatus = 'pending' | 'active' | 'paused' | 'revoked' | 'expired'
 
 export type PositionScope = { kind: string; id: string }
 
@@ -53,11 +53,11 @@ export type RefuseArgs = {
   /** The holder's user document. */
   holder: Record<string, unknown> & { id: string | number }
   grant: PositionGrant
-  /** `grant` for a new grant, `reactivate` when a paused grant is switched back on, `extend` when its end date is moved later or removed. */
-  action: 'grant' | 'reactivate' | 'extend'
+  /** Always `grant`: the veto runs when the holder accepts a grant, including a grant that was resumed or extended and is pending again. */
+  action: 'grant'
 }
 
-export type AuditName = 'grant' | 'revoke' | 'expire' | 'pause' | 'resume' | 'endDate'
+export type AuditName = 'grant' | 'accept' | 'revoke' | 'expire' | 'pause' | 'resume' | 'endDate'
 
 export type AuditEvent = {
   event: AuditName
@@ -96,9 +96,11 @@ export type PositionsOptions = {
    */
   canRead?: (args: Omit<AccessArgs, 'data'>) => boolean | Where | Promise<boolean | Where>
   /**
-   * A veto the host controls, asked on every grant and when a paused grant is switched back on, even for server code
-   * that skips access. Required: pass `false` to say there is no veto. The reason is shown to the person who tried, so
-   * don't put anything private in it. Return `null` (or nothing) to go ahead, or a reason to refuse. A throw, `false` or anything else
+   * A veto the host controls. It runs when the holder accepts a grant, never when someone grants it, so the granter
+   * can't learn who is barred. Every grant, and every resume or extension, leaves the grant pending until the holder
+   * accepts, the same for everyone. Required: pass a function, or exactly `false` for no veto (`null`, `0` and `''` are
+   * refused at setup). A signed-in holder who is vetoed gets a plain Forbidden; the reason is only seen by server code
+   * with no signed-in user. Return `null` (or nothing) to go ahead, or a reason to refuse. A throw, `false` or anything else
    * also refuses, with a general reason.
    */
   refuseGrant: RefuseFn | false
@@ -119,6 +121,8 @@ export type PositionsOptions = {
   audit?: {
     beforeGrant?: AuditHook
     afterGrant?: AuditHook
+    beforeAccept?: AuditHook
+    afterAccept?: AuditHook
     beforeRevoke?: AuditHook
     afterRevoke?: AuditHook
     beforeExpire?: AuditHook

@@ -2,6 +2,50 @@
 
 Kept by this repo's owning session, per `~/Code/CLAUDE.md`, "Test self-audits". Newest first.
 
+## 2026-11-23: eighth review fixes
+
+- Promises checked: a refused update leaves the row byte-identical and never takes the lock, so a granter can't learn who was vetoed from a "just changed" refusal or from `updatedAt`; a host where on a missing related field gives no rows; two identical grants at once give one grant and the "already holds" refusal.
+- Added: a veto held open while a granter edits (ordering is deterministic, no loop), a spy showing refused updates never write the row, a byte-identical row after four kinds of refusal with transactions off, `holder.bogus` and similar wheres (and `holder.email`, `holder.id` still work), identical simultaneous grants with transactions (write conflict) and without (duplicate key), a four-way concurrent accept still giving a winner (105 tests). Checked by reverting the fix: 6 of the new tests fail.
+- Skipped: SQL adapters, a real multi-process run.
+
+## 2026-11-23: seventh review fixes
+
+- Promises checked: a refused accept leaves nothing behind, in any update path; a failing history write can't commit a grant change; a host where on a field a collection lacks gives no rows, not a 500; interface labels end with no period.
+- Added: bulk accept refused over the Local API (minor, adult, staff, server code) and REST, with status, `updatedAt`, history and audit unchanged; a single accept by a minor leaves no bump; a failing history write for a single and a bulk update leaves the grant as it was; dotted and unknown fields in host wheres for grants and history; a label check (98 tests). Two older tests changed from expecting per-row errors to expecting the bulk refusal. Checked by reverting the fix: 6 tests fail.
+- Skipped: the admin's edit-selected action in a browser (none here), SQL adapters. A client's own where on an unknown field already gets a 4xx from Payload, so it has a small test and no fix.
+
+## 2026-11-23: sixth review fixes
+
+- Promises checked: a grant only changes status to one of the five values, over every API, for users and server code, single and bulk; a history read with a host where on a missing field returns no rows; the create form doesn't offer a status.
+- Added: null, empty, unknown and non-string status (Local API with users and server code, bulk Local API, REST single and bulk, GraphQL) with the grant, history and audit unchanged and the grant still revocable; the create form condition; a history where on a field the history lacks, and where on its own fields (91 tests). Checked by reverting the fix: 4 of the new tests fail.
+- Skipped: the admin form in a browser (none here), SQL adapters.
+
+## 2026-11-23: fifth review fixes
+
+- Promises checked: only the plugin sets pending; a pause can't be lifted without `canGrant`, the self-grant check and the veto; a host `where` uses Payload's operators only.
+- Added: both repros (revoke-only user, paused self-holder), active to pending (no history row, no audit event), create with pending for a user and server code, REST and GraphQL, a pending grant re-saved as pending, resume and extension still going to pending, and bogus operators for grants and history (87 tests). Checked by reverting the fix: 7 of the new tests fail.
+- Test hygiene: the shared server stops with `doCleanup` and `force` in a `finally`; extra instances close in a `finally`.
+- Skipped: the admin form with no default on `status` (no browser here).
+
+## 2026-11-23: fourth review fixes
+
+- Promises checked: an extension never undoes a pause; two changes at once give one winner and a clean 403, not a 500; read answers count only as `true`, `false` or a real `where`; the accept hooks run around an accept; the test run leaves no Mongo behind.
+- Added: extending a paused grant (later date, then none), `beforeAccept` and `afterAccept` (order, refused accept, failing hook), four concurrent accepts and accept against revoke over five rounds each, and a wider list of bad read answers (79 tests). Checked by removing the lock: the two concurrency tests fail on a Mongo write conflict.
+- Test hygiene: every extra instance closes in a `finally`; the shared server stops with `doCleanup` and `force` even when closing Payload throws. After two full runs, no `mongod` was left and no `mongo-mem-*` folder from this repo.
+- Skipped: a write conflict on a SQL adapter (no SQL adapter in this repo's tests).
+
+## 2026-11-23: pending grants and the veto at accept
+
+- Promises: every grant is pending and identical for any holder; the veto runs only at accept and its answer doesn't reach the granter; only the holder or server code accepts; `refuseGrant` is a function or exactly `false`; `{}` and `[]` read answers are no; the revoke-only refusal is Forbidden.
+- Covered: each, in `test/plugin.test.ts` (74 tests), including local API and REST comparisons of a grant to a minor and to an adult on create, resume and extension.
+- Gaps skipped (and why): timing differences between vetoed and unvetoed accepts (no promise made).
+
+## 2026-11-23: after the veto change
+
+- Promise checked: a granter can't tell a vetoed grantee from a grant they may not make.
+- Added: same message and status through the local API and REST, for a veto reason, a throwing veto, a resume and an extension; nothing written and no history row; server code still sees the reason (66 tests).
+- Skipped: timing differences (a vetoed grant does a few more queries); a plugin can't make the host's veto constant-time.
+
 ## 2026-11-23: after the follow-ups
 
 - Promises checked: the plugin refuses to start without transactions and every change still checks its own request; `canReadPrivate` is given no grant when there is no document and can't be used to filter on notes; dates must be real and zoned; the veto sees a null end date; notes and history stay closed over REST and GraphQL when the host gave no `canReadPrivate`.
