@@ -2,6 +2,12 @@
 
 Kept by this repo's owning session, per `~/Code/CLAUDE.md`, "Test self-audits". Newest first.
 
+## 2026-11-24: ninth review fixes
+
+- Promises checked: with transactions off, a refusal that comes after the field checks leaves the row and the response byte-identical; only a duplicate on `liveKey` (E11000, ValidationError or WriteConflict 112) reads as "already holds", and every other database error passes through; a host where resolves against the users collection's field list, so fields in rows, groups, tabs and arrays match and unknown or too-deep paths give no rows; the lock is taken after the veto and after every host before hook.
+- Added: opt-out refusals for oversized notes and a throwing host hook, injected driver errors for the duplicate mapping, nested and unknown where paths, and `claimLast` with gate tests (115 tests). Checked by reverting the fix: 6 of the new tests fail on 0.2.0. The independent review also mutated the code (no `claimLast`, claim above the veto, claim above the host hooks, no early return, the transient label mapped again, unknown fields resolving) and each mutation fails at least one test.
+- Skipped: SQL adapters (the README says so). Polymorphic relationships and blocks in the users collection give no rows by design, and have a probe in the review rather than a test here.
+
 ## 2026-11-23: eighth review fixes
 
 - Promises checked: a refused update leaves the row byte-identical and never takes the lock, so a granter can't learn who was vetoed from a "just changed" refusal or from `updatedAt`; a host where on a missing related field gives no rows; two identical grants at once give one grant and the "already holds" refusal.
