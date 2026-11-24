@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- **With `allowWithoutTransactions` and no transaction, the write lock is skipped.** It can't be rolled back there, so it only left an `updatedAt` bump behind after a later refusal.
+- **The write lock now runs after hooks a host adds to the grants' `beforeChange`**, not just after the plugin's own checks. A host hook that throws leaves the row unclaimed.
+- **Duplicate-grant mapping is narrower.** The wrapper on the adapter's `db.create` for grants maps only a duplicate key on `liveKey`, a validation error on `liveKey` and a write conflict (code 112). The transient-transaction label and bare "unique constraint" text no longer match, and a duplicate on another index passes through unchanged. The README says why the wrapper exists.
+- **A host `where` with a nested path reads the accounts collection's flattened fields.** `holder.nickname` inside a row, `holder.profile.city` in a group and `holder.tags.label` in an array now match. A three-segment path that names no field (`holder.a.b`, `holder.email.x`) gives no rows, not a 500.
+
+Tested: the full suite against a real Payload with an in-memory MongoDB. Ten new tests (115 in all); six fail on 0.2.0.
+Not tested: SQL adapters, more than one server process, the admin in a browser.
+
 ## 0.2.0 (2026-11-23)
 
 **Breaking.** Hosts have to change something to upgrade from 0.1.0:

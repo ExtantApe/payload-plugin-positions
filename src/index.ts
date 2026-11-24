@@ -1,6 +1,6 @@
 import type { Config, Payload, Plugin } from 'payload'
 
-import { mapDuplicateGrant, positionCollections } from './collection.js'
+import { claimLast, mapDuplicateGrant, positionCollections } from './collection.js'
 import type { PositionsOptions } from './types.js'
 
 export { expireGrants } from './expire.js'
@@ -48,6 +48,7 @@ export const positions =
       onInit: async (payload) => {
         await config.onInit?.(payload)
         mapDuplicateGrant(payload)
+        claimLast(payload as never)
         await checkTransactions(payload, options.allowWithoutTransactions)
       },
     }

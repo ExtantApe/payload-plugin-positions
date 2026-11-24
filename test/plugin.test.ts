@@ -2,9 +2,10 @@ import { mongooseAdapter } from '@payloadcms/db-mongodb'
 import { configToSchema } from '@payloadcms/graphql'
 import { graphql } from 'graphql'
 import { MongoMemoryReplSet } from 'mongodb-memory-server'
-import { buildConfig, createLocalReq, getPayload, handleEndpoints, type Payload } from 'payload'
+import { buildConfig, createLocalReq, getPayload, handleEndpoints, ValidationError, type Payload } from 'payload'
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { mapDuplicateGrant } from '../src/collection.js'
 import { checkTransactions, expireGrants, hasPosition, positions, positionsOf, type AuditEvent } from '../src/index.js'
 
 /**
@@ -1805,5 +1806,178 @@ describe('eighth review fixes: where on a relationship, and two identical grants
       expect(other).toMatch(/already holds this position here/i)
     }
     expect((await grants()).docs.filter((d) => String((d as never as { scopeId: string }).scopeId).startsWith('race-'))).toHaveLength(3)
+  })
+})
+
+describe('ninth review fixes: the lock follows host hooks, opt-out mode never bumps, nested wheres, narrow duplicate mapping', () => {
+  /** A plugin that runs after positions and adds a beforeChange hook to the grants, as a host would. */
+  const hostHook = (hook: () => void) => (config: Awaited<ReturnType<typeof buildConfig>> | never) => {
+    const c = config as { collections?: { slug: string; hooks?: { beforeChange?: unknown[] } }[] }
+    for (const col of c.collections ?? [])
+      if (col.slug === 'position-grants') col.hooks = { ...col.hooks, beforeChange: [...(col.hooks?.beforeChange ?? []), hook] }
+    return config as never
+  }
+  const siteWith = async (key: string, transactions: boolean, hook: () => void) =>
+    buildConfig({
+      secret: 'test-secret-not-for-production',
+      telemetry: false,
+      typescript: { autoGenerate: false },
+      db: mongooseAdapter({ url: mongo.getUri(key), ...(transactions ? {} : { transactionOptions: false }) }),
+      collections: [{ slug: 'users', auth: true, fields: [] }],
+      plugins: [
+        positions({ positionTypes: [{ value: 'editor' }], scopeKinds: [{ value: 'project' }], refuseGrant: false, allowWithoutTransactions: !transactions, canGrant: () => true }),
+        hostHook(hook) as never,
+      ],
+    })
+
+  for (const transactions of [true, false]) {
+    it(`leaves the row unclaimed when a host beforeChange hook throws (${transactions ? 'with' : 'without'} transactions)`, async () => {
+      const key = transactions ? 'ninehooktx' : 'ninehookopt'
+      let boom = false
+      const writes: unknown[] = []
+      const order: string[] = []
+      const site = await siteWith(key, transactions, () => {
+        order.push(`host-hook-after-${writes.length}-claims`)
+        if (boom) throw new Error('host refused')
+      })
+      try {
+        const p = await getPayload({ config: site, key })
+        await settle(p)
+        const g = (await p.create({ collection: 'users', data: { email: 'g@example.com', password: PW } as never })) as unknown as U
+        const h = (await p.create({ collection: 'users', data: { email: 'h@example.com', password: PW } as never })) as unknown as U
+        const row = (await p.create({ collection: 'position-grants' as never, data: { holder: h.id, position: 'editor', scopeKind: 'project', scopeId: 'a' } as never, user: as(g), overrideAccess: false })) as never as { id: string }
+        const read = async () => JSON.stringify(await p.findByID({ collection: 'position-grants' as never, id: row.id as never }))
+        const before = await read()
+        await new Promise((r) => setTimeout(r, 15))
+        const real = p.db.updateOne.bind(p.db)
+        const spy = vi.spyOn(p.db, 'updateOne').mockImplementation(((a: { collection: string; data: Record<string, unknown> }) => {
+          if (a.collection === 'position-grants' && Object.keys(a.data).length === 0) writes.push(a.data)
+          return real(a as never)
+        }) as never)
+        try {
+          boom = true
+          const out = await refused(p.update({ collection: 'position-grants' as never, id: row.id as never, data: { endsAt: iso(DAY) } as never, user: as(g), overrideAccess: false }))
+          expect(out).toMatch(/host refused/)
+          expect(writes).toEqual([])
+          expect(await read()).toBe(before)
+          // the same change with no host refusal claims after the host's hook ran
+          boom = false
+          order.length = 0
+          await p.update({ collection: 'position-grants' as never, id: row.id as never, data: { endsAt: iso(DAY) } as never, user: as(g), overrideAccess: false })
+          expect(order).toEqual(['host-hook-after-0-claims'])
+          expect(writes.length).toBe(transactions ? 1 : 0)
+        } finally {
+          spy.mockRestore()
+        }
+      } finally {
+        await close(site, key)
+      }
+    })
+  }
+
+  it('does not claim the row at all when there is no transaction', async () => {
+    const site = await siteWith('ninenotx', false, () => {})
+    try {
+      const p = await getPayload({ config: site, key: 'ninenotx' })
+      await settle(p)
+      const g = (await p.create({ collection: 'users', data: { email: 'g@example.com', password: PW } as never })) as unknown as U
+      const h = (await p.create({ collection: 'users', data: { email: 'h@example.com', password: PW } as never })) as unknown as U
+      const row = (await p.create({ collection: 'position-grants' as never, data: { holder: h.id, position: 'editor', scopeKind: 'project', scopeId: 'a' } as never, user: as(g), overrideAccess: false })) as never as { id: string }
+      const empty: unknown[] = []
+      const real = p.db.updateOne.bind(p.db)
+      const spy = vi.spyOn(p.db, 'updateOne').mockImplementation(((a: { collection: string; data: Record<string, unknown> }) => {
+        if (a.collection === 'position-grants' && Object.keys(a.data).length === 0) empty.push(a)
+        return real(a as never)
+      }) as never)
+      try {
+        await p.update({ collection: 'position-grants' as never, id: row.id as never, data: { endsAt: iso(DAY) } as never, user: as(g), overrideAccess: false })
+        expect(empty).toEqual([])
+      } finally {
+        spy.mockRestore()
+      }
+    } finally {
+      await close(site, 'ninenotx')
+    }
+  })
+
+  it('reads a host where through rows, groups and arrays of the accounts collection, and refuses what is not there', async () => {
+    const answer: { v: unknown } = { v: true }
+    const site = await buildConfig({
+      secret: 'test-secret-not-for-production',
+      telemetry: false,
+      typescript: { autoGenerate: false },
+      db: mongooseAdapter({ url: mongo.getUri('ninewhere'), transactionOptions: false }),
+      collections: [
+        {
+          slug: 'users',
+          auth: true,
+          fields: [
+            { type: 'row', fields: [{ name: 'nickname', type: 'text' }] },
+            { name: 'profile', type: 'group', fields: [{ name: 'city', type: 'text' }] },
+            { name: 'tags', type: 'array', fields: [{ name: 'label', type: 'text' }] },
+          ],
+        },
+      ],
+      plugins: [positions({ positionTypes: [{ value: 'editor' }], scopeKinds: [{ value: 'project' }], refuseGrant: false, allowWithoutTransactions: true, canGrant: () => true, canRead: () => answer.v as never })],
+    })
+    try {
+      const p = await getPayload({ config: site, key: 'ninewhere' })
+      const u = (await p.create({ collection: 'users', data: { email: 'a@example.com', password: PW } as never })) as unknown as U
+      const h = (await p.create({ collection: 'users', data: { email: 'b@example.com', password: PW, nickname: 'bee', profile: { city: 'Tucson' }, tags: [{ label: 'x' }] } as never })) as unknown as U
+      await p.create({ collection: 'position-grants' as never, data: { holder: h.id, position: 'editor', scopeKind: 'project', scopeId: 'a' } as never, user: as(u), overrideAccess: false })
+      const total = async () => ((await p.find({ collection: 'position-grants' as never, user: as(u), overrideAccess: false })) as { totalDocs: number }).totalDocs
+      const cases: [string, unknown, number][] = [
+        ['holder.nickname', 'bee', 1],
+        ['holder.nickname', 'wasp', 0],
+        ['holder.profile.city', 'Tucson', 1],
+        ['holder.profile.city', 'Mesa', 0],
+        ['holder.tags.label', 'x', 1],
+        ['holder.profile.bogus', 'x', 0],
+        ['holder.email.deeper', 'x', 0],
+        ['holder.a.b', 'x', 0],
+        ['holder.nickname.deeper', 'bee', 0],
+        ['grantedBy.profile.city', 'x', 0],
+      ]
+      for (const [path, value, want] of cases) {
+        answer.v = { [path]: { equals: value } }
+        expect(await total(), path + '=' + String(value)).toBe(want)
+      }
+    } finally {
+      await close(site, 'ninewhere')
+    }
+  })
+
+  describe('mapDuplicateGrant maps only a duplicate on liveKey, a validation error on liveKey and a write conflict', () => {
+    const wrap = (err: unknown, collection = 'position-grants') => {
+      const fake = { db: { create: async () => { throw err } } }
+      mapDuplicateGrant(fake as never)
+      return refused((fake.db as { create: (a: unknown) => Promise<unknown> }).create({ collection }))
+    }
+    const HOLDS_MSG = 'That account already holds this position here.'
+    const err = (props: Record<string, unknown>, message = 'boom') => Object.assign(new Error(message), props)
+    it('maps a duplicate key on liveKey, by message, keyPattern or keyValue', async () => {
+      expect(await wrap(err({ code: 11000 }, 'E11000 duplicate key error collection: x index: liveKey_1 dup key: { liveKey: "a" }'))).toBe(HOLDS_MSG)
+      expect(await wrap(err({ code: 11000, keyPattern: { liveKey: 1 } }, 'E11000 duplicate key'))).toBe(HOLDS_MSG)
+      expect(await wrap(err({ code: 11000, keyValue: { liveKey: 'a' } }, 'E11000 duplicate key'))).toBe(HOLDS_MSG)
+    })
+    it('maps a validation error on liveKey', async () => {
+      expect(await wrap(new ValidationError({ errors: [{ path: 'liveKey', message: 'Value must be unique' }] } as never))).toBe(HOLDS_MSG)
+    })
+    it('maps a write conflict, by code or code name', async () => {
+      expect(await wrap(err({ code: 112 }))).toBe(HOLDS_MSG)
+      expect(await wrap(err({ codeName: 'WriteConflict' }))).toBe(HOLDS_MSG)
+    })
+    it('rethrows a duplicate key on another index unchanged', async () => {
+      expect(await wrap(err({ code: 11000, keyPattern: { email: 1 } }, 'E11000 duplicate key error index: email_1'))).toMatch(/email_1/)
+    })
+    it('rethrows a bare transient-transaction label and a bare unique-constraint text unchanged', async () => {
+      expect(await wrap(err({ errorLabels: ['TransientTransactionError'] }, 'boom'))).toBe('boom')
+      expect(await wrap(err({}, 'a unique constraint failed'))).toBe('a unique constraint failed')
+      expect(await wrap(err({}, 'duplicate key value violates something'))).toBe('duplicate key value violates something')
+    })
+    it('rethrows a validation error on another field unchanged, and ignores other collections', async () => {
+      expect(await wrap(new ValidationError({ errors: [{ path: 'scopeId', message: 'bad' }] } as never))).not.toBe(HOLDS_MSG)
+      expect(await wrap(err({ code: 112 }), 'users')).toBe('boom')
+    })
   })
 })
