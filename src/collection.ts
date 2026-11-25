@@ -203,7 +203,7 @@ export function positionCollections(opts: Required<Pick<PositionsOptions, 'users
     // The id may still be a promise, and stays one when the adapter has no transactions to give.
     if (opts.allowWithoutTransactions || (await req.transactionID)) return
     req.payload.logger.error('positions: refusing a change because the database has transactions off. Turn them on, or set allowWithoutTransactions.')
-    throw refuse('This can’t be done right now.')
+    throw new APIError('This can’t be done right now.', 403, { refusal: 'transactions-required' }, true)
   }
 
   const run = async (name: keyof NonNullable<PositionsOptions['audit']>, event: AuditEvent, mustPass: boolean) => {

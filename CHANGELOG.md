@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A write refused for a missing transaction (the database stopped handing them out, or server code passed `disableTransaction`) now throws a 403 whose data is exactly `{ refusal: 'transactions-required' }`. The message is unchanged. Review tools such as whitehat count only that shape, or a bare 401, 403 or 404, as a refusal, so this guard showed as not checked before. Tested: the no-transaction test now checks the shape (115 in all); it fails on the old code. Not tested: a live site.
 - **With `allowWithoutTransactions` and no transaction, the write lock is skipped.** It can't be rolled back there, so it only left an `updatedAt` bump behind after a later refusal.
 - **The write lock now runs after hooks a host adds to the grants' `beforeChange`**, not just after the plugin's own checks. A host hook that throws leaves the row unclaimed.
 - **Duplicate-grant mapping is narrower.** The wrapper on the adapter's `db.create` for grants maps only a duplicate key on `liveKey`, a validation error on `liveKey` and a write conflict (code 112). The transient-transaction label and bare "unique constraint" text no longer match, and a duplicate on another index passes through unchanged. The README says why the wrapper exists.
