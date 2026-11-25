@@ -41,6 +41,13 @@ const live = async (data: Record<string, unknown>, user: U | null = staff) => {
 const status0 = async (id: string | number) => ((await payload.findByID({ collection: 'position-grants' as never, id: id as never })) as never as { status: string }).status
 const base = () => ({ holder: alice.id, position: 'editor', scopeKind: 'project', scopeId: 'p-1' })
 const grants = () => payload.find({ collection: 'position-grants' as never, pagination: false, overrideAccess: true })
+const marker = async (p: Promise<unknown>) => {
+  // The shape review tools such as whitehat accept as a refusal: a 403 whose data is exactly { refusal: 'transactions-required' }.
+  const e = (await p.then(() => null, (err: unknown) => err)) as { status?: unknown; data?: unknown } | null
+  expect(e?.status).toBe(403)
+  expect(e?.data).toEqual({ refusal: 'transactions-required' })
+  expect(Object.getPrototypeOf(e?.data)).toBe(Object.prototype)
+}
 const refused = async (p: Promise<unknown>) => {
   try {
     await p
@@ -872,6 +879,7 @@ describe('second review fixes', () => {
       const h = (await p.create({ collection: 'users', data: { email: 'b@example.com', password: PW } as never })) as unknown as U
       const data = { holder: h.id, position: 'editor', scopeKind: 'project', scopeId: 'a' } as never
       expect(await refused(p.create({ collection: 'position-grants' as never, data, user: as(u), overrideAccess: false }))).toMatch(/can’t be done right now/)
+      await marker(p.create({ collection: 'position-grants' as never, data, user: as(u), overrideAccess: false }))
       expect((await p.find({ collection: 'position-grants' as never, overrideAccess: true })).totalDocs).toBe(0)
     } finally {
       await close(config, 'notx-req')
